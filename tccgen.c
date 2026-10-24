@@ -116,12 +116,19 @@ static struct scope {
     struct { Sym *s; int n; } cl;
     int *bsym, *csym;
     Sym *lstk, *llstk;
+    int filc_mark; /* runtime track depth at the scope's first VLA */
 } *cur_scope, *loop_scope, *root_scope;
 
 typedef struct {
     Section *sec;
     int local_offset;
     Sym *flex_array_ref;
+    /* Set for a static or global object while its initializer runs.
+     * Pointer relocs are queued against this object. */
+    Sym *filc_obj;
+    unsigned long filc_base;
+    unsigned long filc_size;
+    unsigned filc_flags;
 } init_params;
 
 #if 1
@@ -146,6 +153,7 @@ static void parse_expr_type(CType *type);
 static void init_putv(init_params *p, CType *type, unsigned long c);
 static void decl_initializer(init_params *p, CType *type, unsigned long c, int flags);
 static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, int v, int scope);
+static void filc_gen_reset(void);
 static int decl(int l);
 static void expr_eq(void);
 static void vpush_type_size(CType *type, int *a);
@@ -408,6 +416,7 @@ ST_FUNC int tccgen_compile(TCCState *s1)
     nocode_wanted = DATA_ONLY_WANTED; /* no code outside of functions */
     debug_modes = (s1->do_debug ? 1 : 0) | s1->test_coverage << 1;
     global_expr = 0;
+    filc_gen_reset();
 
     tcc_debug_start(s1);
     tcc_tcov_start (s1);
@@ -896,6 +905,9 @@ static void vsetc(CType *type, int r, CValue *vc)
     vtop->r2 = VT_CONST;
     vtop->c = *vc;
     vtop->sym = NULL;
+    vtop->filc_kind = 0;
+    vtop->filc_chk = 0;
+    vtop->filc_slot = 0;
 }
 
 ST_FUNC void vswap(void)
@@ -1173,6 +1185,2362 @@ ST_FUNC void vpush_helper_func(int v)
 {
     vpushsym(&func_old_type, external_helper_sym(v));
 }
+
+/* ------------------------------------------------------------------ */
+/* -filc: optional InvisiCaps subset. Off unless TCCState.filc is set.
+ * A capability is a "lower" (payload base) kept in a compiler temp,
+ * separate from the user-visible pointer. See lib/filc_rt.c. */
+
+#define FILC_KIND_NONE 0
+#define FILC_KIND_NULL 1
+#define FILC_KIND_SLOT 2
+#define FILC_F_READONLY 1
+#define FILC_F_FUNC     2
+#define FILC_RET_NONE 0
+#define FILC_RET_NULL 1
+#define FILC_RET_GET  2
+#define FILC_RET_PTR  3
+
+static int filc_ret_mode;
+static int filc_ret_slot;
+static int filc_frame_pushed;
+static int filc_mark_slot;
+static int filc_asm_warned;
+/* Callee: lower of the caller's memory-sret object, or 0. */
+static int filc_sret_slot;
+/* Set while the backend copies a struct argument onto the stack. */
+static int filc_covering_arg_copy;
+static int filc_n_arg_temps;
+static int filc_arg_temps[16];
+/* Byte count of an alloca(), saved across gfunc_call. 0 if this call is not alloca. */
+static int filc_alloca_size_slot;
+
+#ifdef TCC_TARGET_X86_64
+ST_FUNC int gfunc_arg_inreg(CType *ty, int *ireg, int *sreg);
+#else
+/* Other targets: treat every aggregate as a memory argument. */
+static int gfunc_arg_inreg(CType *ty, int *ireg, int *sreg)
+{
+    (void)ty; (void)ireg; (void)sreg;
+    return 0;
+}
+#endif
+
+ST_FUNC void filc_struct_arg_copy(int on)
+{
+    filc_covering_arg_copy = on && tcc_state->filc;
+}
+
+static int filc_on(void)
+{
+    return tcc_state->filc && !nocode_wanted;
+}
+
+/* The object itself is const. TCC stores array qualifiers on the element
+ * type, so `const int a[2]` has VT_CONSTANT on the int, not the array.
+ * A plain pointer variable is left writable: `const int *p` is not const. */
+static int filc_obj_readonly(CType *type)
+{
+    CType *t = type;
+    if ((t->t & VT_BTYPE) == VT_PTR && !(t->t & VT_ARRAY))
+        return 0;
+    while (t->t & VT_ARRAY) {
+        if (t->t & VT_CONSTANT)
+            return 1;
+        t = &t->ref->type;
+    }
+    return (t->t & VT_CONSTANT) != 0;
+}
+
+/* A section the linker will not write. Common symbols are not allocated
+ * yet; they land in bss and stay writable. */
+static int filc_sec_readonly(Section *sec, CType *type)
+{
+    if (type && filc_obj_readonly(type))
+        return 1;
+    if (!sec)
+        return 0;
+    if ((sec->sh_flags & SHF_ALLOC) && !(sec->sh_flags & SHF_WRITE))
+        return 1;
+    return 0;
+}
+
+/* One reloc record in the filc_init section. The runtime constructor
+ * walks __start_filc_init .. __stop_filc_init. Layout matches
+ * filc_init_rec in lib/filc_rt.c on LP64. has_slot == 0 publishes the
+ * object's size only (no pointer to store). */
+#if PTR_SIZE == 8
+enum { FILC_INIT_REC_SIZE = 48 };
+struct filc_irec {
+    Sym *obj;
+    unsigned long slot_off;
+    unsigned long obj_size;
+    unsigned obj_flags;
+    Sym *tgt;
+    unsigned long tgt_size;
+    unsigned tgt_flags;
+    int has_slot;
+};
+static struct filc_irec *filc_irecs;
+static int nb_filc_irecs, nb_filc_irecs_alloc;
+static Section *filc_init_section;
+
+static Section *filc_init_sec(void)
+{
+    Section *s = filc_init_section;
+    if (!s) {
+        s = find_section(tcc_state, "filc_init");
+        if (s->sh_addralign < PTR_SIZE)
+            s->sh_addralign = PTR_SIZE;
+        filc_init_section = s;
+    }
+    return s;
+}
+
+static void filc_sym_bounds(Sym *sym, unsigned long *size, unsigned *flags)
+{
+    int align, sz;
+    ElfSym *es;
+    Section *s;
+    *size = 0;
+    *flags = 0;
+    if (!sym)
+        return;
+    if ((sym->type.t & VT_BTYPE) == VT_FUNC) {
+        *flags = FILC_F_FUNC;
+        return;
+    }
+    sz = type_size(&sym->type, &align);
+    if (sz > 0)
+        *size = (unsigned long)sz;
+    else {
+        es = elfsym(sym);
+        if (es && es->st_size)
+            *size = (unsigned long)es->st_size;
+    }
+    es = elfsym(sym);
+    if (es && es->st_shndx != SHN_UNDEF && es->st_shndx < SHN_LORESERVE) {
+        s = tcc_state->sections[es->st_shndx];
+        if (filc_sec_readonly(s, &sym->type))
+            *flags |= FILC_F_READONLY;
+    } else if (filc_obj_readonly(&sym->type)) {
+        *flags |= FILC_F_READONLY;
+    }
+}
+
+static void filc_emit_init_rec(Sym *obj, unsigned long slot_off,
+    unsigned long obj_size, unsigned obj_flags,
+    Sym *tgt, unsigned long tgt_size, unsigned tgt_flags, int has_slot)
+{
+    Section *sec;
+    unsigned long off;
+    unsigned char *ptr;
+    struct filc_irec *r;
+    if (!obj || !elfsym(obj))
+        return;
+    if (has_slot && ((slot_off & (PTR_SIZE - 1)) || slot_off + PTR_SIZE > obj_size))
+        return;
+    sec = filc_init_sec();
+    off = section_add(sec, FILC_INIT_REC_SIZE, PTR_SIZE);
+    ptr = sec->data + off;
+    if (has_slot) {
+        greloca(sec, obj, off + 0, R_DATA_PTR, slot_off);
+        greloca(sec, obj, off + PTR_SIZE, R_DATA_PTR, 0);
+        if (tgt && elfsym(tgt))
+            greloca(sec, tgt, off + 2 * PTR_SIZE, R_DATA_PTR, 0);
+    } else {
+        greloca(sec, obj, off + PTR_SIZE, R_DATA_PTR, 0);
+    }
+    write64le(ptr + 24, obj_size);
+    write64le(ptr + 32, tgt_size);
+    write32le(ptr + 40, obj_flags);
+    write32le(ptr + 44, tgt_flags);
+    if (nb_filc_irecs >= nb_filc_irecs_alloc) {
+        int n = nb_filc_irecs_alloc ? nb_filc_irecs_alloc * 2 : 16;
+        filc_irecs = tcc_realloc(filc_irecs, (unsigned long)n * sizeof(*filc_irecs));
+        nb_filc_irecs_alloc = n;
+    }
+    r = &filc_irecs[nb_filc_irecs++];
+    r->obj = obj;
+    r->slot_off = slot_off;
+    r->obj_size = obj_size;
+    r->obj_flags = obj_flags;
+    r->tgt = tgt;
+    r->tgt_size = tgt_size;
+    r->tgt_flags = tgt_flags;
+    r->has_slot = has_slot;
+}
+
+static void filc_note_ptr_init(init_params *p, unsigned long c)
+{
+    unsigned long slot, tsz;
+    unsigned tf;
+    if (!tcc_state->filc || !p->filc_obj)
+        return;
+    if (!(vtop->r & VT_SYM) || !vtop->sym)
+        return;
+    if (c < p->filc_base)
+        return;
+    slot = c - p->filc_base;
+    filc_sym_bounds(vtop->sym, &tsz, &tf);
+    filc_emit_init_rec(p->filc_obj, slot, p->filc_size, p->filc_flags,
+        vtop->sym, tsz, tf, 1);
+}
+
+/* A compound literal was memcpy'd into this object. Duplicate the
+ * pointer records that fell inside the copied bytes. */
+static void filc_copy_init_recs(init_params *p, Sym *src,
+    unsigned long src_off, unsigned long nbytes, unsigned long dest_c)
+{
+    int i, n;
+    if (!tcc_state->filc || !p->filc_obj || !src || dest_c < p->filc_base)
+        return;
+    n = nb_filc_irecs;
+    for (i = 0; i < n; i++) {
+        struct filc_irec *r = &filc_irecs[i];
+        unsigned long slot;
+        if (!r->has_slot || r->obj != src)
+            continue;
+        if (r->slot_off < src_off || r->slot_off + PTR_SIZE > src_off + nbytes)
+            continue;
+        slot = (dest_c - p->filc_base) + (r->slot_off - src_off);
+        filc_emit_init_rec(p->filc_obj, slot, p->filc_size, p->filc_flags,
+            r->tgt, r->tgt_size, r->tgt_flags, 1);
+    }
+}
+
+static void filc_emit_obj(Sym *sym, unsigned long size, unsigned flags)
+{
+    if (!tcc_state->filc || !sym || !size)
+        return;
+    if ((sym->type.t & VT_BTYPE) == VT_FUNC)
+        return;
+    filc_emit_init_rec(sym, 0, size, flags, NULL, 0, 0, 0);
+    /* Later uses snapshot the address as the lower instead of calling
+     * filc_cover on every reference. */
+    sym->a.filc_reg = 1;
+}
+#else
+static void filc_note_ptr_init(init_params *p, unsigned long c)
+{
+    (void)p; (void)c;
+}
+static void filc_copy_init_recs(init_params *p, Sym *src,
+    unsigned long src_off, unsigned long nbytes, unsigned long dest_c)
+{
+    (void)p; (void)src; (void)src_off; (void)nbytes; (void)dest_c;
+}
+static void filc_emit_obj(Sym *sym, unsigned long size, unsigned flags)
+{
+    (void)sym; (void)size; (void)flags;
+}
+#endif
+
+static void filc_gen_reset(void)
+{
+#if PTR_SIZE == 8
+    filc_init_section = NULL;
+    tcc_free(filc_irecs);
+    filc_irecs = NULL;
+    nb_filc_irecs = 0;
+    nb_filc_irecs_alloc = 0;
+#endif
+}
+
+static int filc_raw_slot(void)
+{
+    loc = (loc - PTR_SIZE) & -PTR_SIZE;
+    return loc;
+}
+
+/* A spill of a long double is 16 bytes. An 8-byte slot lets fstpt
+ * overwrite the next capability. */
+static int filc_slot_for(int t)
+{
+    CType ty;
+    int size, align;
+    memset(&ty, 0, sizeof ty);
+    /* Enum and bitfield tags, and array bounds, live in a Sym. A spilled
+     * register is the integer base type, or the address of an array. */
+    t &= ~VT_STRUCT_MASK;
+    t &= ~(VT_ARRAY | VT_VLA);
+    if ((t & VT_BTYPE) == VT_STRUCT)
+        tcc_error("filc: cannot spill a struct");
+    ty.t = t;
+    size = type_size(&ty, &align);
+    if (size < PTR_SIZE)
+        size = PTR_SIZE;
+    if (align < PTR_SIZE)
+        align = PTR_SIZE;
+    loc = (loc - size) & -align;
+    return loc;
+}
+
+/* block() has a local named o, so the byte emitter cannot be called there. */
+static void filc_drop_ld(void)
+{
+#if defined(TCC_TARGET_I386) || defined(TCC_TARGET_X86_64)
+    o(0xd8dd); /* fstp %st(0) */
+#endif
+}
+
+static void filc_store_reg(int r, int t, int slot)
+{
+    SValue sv;
+    memset(&sv, 0, sizeof sv);
+    sv.type.t = t;
+    sv.r = VT_LOCAL | VT_LVAL;
+    sv.c.i = slot;
+    store(r, &sv);
+}
+
+static void filc_load_reg(int r, int t, int slot)
+{
+    SValue sv;
+    memset(&sv, 0, sizeof sv);
+    sv.type.t = t;
+    sv.r = VT_LOCAL | VT_LVAL;
+    sv.c.i = slot;
+    load(r, &sv);
+}
+
+/* Push the lower described by (slot, kind). kind SLOT loads the temp;
+ * anything else pushes a null lower. The pushed value is not a checked
+ * user lvalue. */
+static void filc_push_saved(int slot, int kind)
+{
+    CType ty;
+    ty.t = VT_PTR;
+    ty.ref = NULL;
+    if (kind == FILC_KIND_SLOT && slot)
+        vset(&ty, VT_LOCAL | VT_LVAL, slot);
+    else
+        vset(&ty, VT_CONST, 0);
+}
+
+/* Turn vtop into a pointer-sized address of that lvalue. */
+static void filc_materialize_addr(void)
+{
+    if (vtop->r & VT_LVAL)
+        gaddrof();
+    vtop->type.t = VT_PTR;
+    vtop->type.ref = NULL;
+    vtop->filc_kind = 0;
+    vtop->filc_chk = 0;
+    vtop->filc_slot = 0;
+}
+
+static void filc_emit_check(int write)
+{
+    int size, align, k, s;
+    size = type_size(&vtop->type, &align);
+    if (size < 0)
+        size = 1;
+    k = vtop->filc_kind;
+    s = vtop->filc_slot;
+    vdup();
+    filc_materialize_addr();
+    filc_push_saved(s, k);
+    vswap();
+    vpushs((addr_t)size);
+    vpushi(write);
+    vpush_helper_func(TOK_filc_check);
+    vrott(5);
+    gfunc_call(4);
+}
+
+/* Load the capability of the pointer lvalue in vtop into a fresh temp.
+ * Leaves vtop as it was. */
+static int filc_capture_load_cap(void)
+{
+    int slot = filc_raw_slot();
+    int k = vtop->filc_kind;
+    int s = vtop->filc_slot;
+    vdup();
+    filc_materialize_addr();
+    filc_push_saved(s, k);
+    vswap();
+    vpush_helper_func(TOK_filc_load_cap);
+    vrott(3);
+    gfunc_call(2);
+    filc_store_reg(REG_IRET, VT_PTR, slot);
+    return slot;
+}
+
+static int filc_gv_prepare(int *kind, int *slot)
+{
+    int is_ptr;
+    if (!filc_on() || !(vtop->r & VT_LVAL) || !vtop->filc_chk)
+        return 0;
+    is_ptr = (vtop->type.t & VT_BTYPE) == VT_PTR && !(vtop->type.t & VT_ARRAY);
+    filc_emit_check(0);
+    if (is_ptr) {
+        *slot = filc_capture_load_cap();
+        *kind = FILC_KIND_SLOT;
+    } else {
+        *slot = 0;
+        *kind = FILC_KIND_NONE;
+    }
+    vtop->filc_chk = 0;
+    return 1;
+}
+
+static void filc_gv_finish(int fix, int kind, int slot)
+{
+    if (!fix)
+        return;
+    vtop->filc_kind = kind;
+    vtop->filc_slot = slot;
+    vtop->filc_chk = 0;
+}
+
+/* Atomic integer+capability store. Value is already in a register.
+ * Leaves dest, value with the value reloaded from a spill slot. */
+static void filc_emit_store_ptr(void)
+{
+    int sk, ss, dk, ds, vs;
+    CType ty;
+    sk = vtop->filc_kind;
+    ss = vtop->filc_slot;
+    vs = filc_slot_for(VT_PTR);
+    filc_store_reg(vtop->r & VT_VALMASK, VT_PTR, vs);
+    vswap();
+    dk = vtop->filc_kind;
+    ds = vtop->filc_slot;
+    vdup();
+    filc_materialize_addr();
+    filc_push_saved(ds, dk);
+    vswap();
+    filc_push_saved(ss, sk);
+    ty.t = VT_PTR;
+    ty.ref = NULL;
+    vset(&ty, VT_LOCAL | VT_LVAL, vs);
+    vpush_helper_func(TOK_filc_store_ptr);
+    vrott(5);
+    gfunc_call(4);
+    vswap();
+    vtop->r = VT_LOCAL | VT_LVAL;
+    vtop->c.i = vs;
+    vtop->sym = NULL;
+    vtop->filc_kind = sk;
+    vtop->filc_slot = ss;
+    vtop->filc_chk = 0;
+}
+
+static void filc_emit_store_cap_direct(int obj_slot, int addr_off, int cap_kind, int cap_slot)
+{
+    CType ty;
+    ty.t = VT_PTR;
+    ty.ref = NULL;
+    filc_push_saved(obj_slot, FILC_KIND_SLOT);
+    vset(&ty, VT_LOCAL, addr_off);
+    filc_push_saved(cap_slot, cap_kind);
+    vpush_helper_func(TOK_filc_store_cap);
+    vrott(4);
+    gfunc_call(3);
+}
+
+static int filc_cover_stack_addr(int offset, int size, int flags)
+{
+    int slot;
+    CType ty;
+    if (!filc_on())
+        return 0;
+    if (size < 0)
+        size = 0;
+    slot = filc_raw_slot();
+    ty.t = VT_PTR;
+    ty.ref = NULL;
+    vset(&ty, VT_LOCAL, offset);
+    vpushs((addr_t)size);
+    vpushi(flags);
+    vpush_helper_func(TOK_filc_cover);
+    vrott(4);
+    gfunc_call(3);
+    filc_store_reg(REG_IRET, VT_PTR, slot);
+    filc_push_saved(slot, FILC_KIND_SLOT);
+    vpush_helper_func(TOK_filc_track);
+    vrott(2);
+    gfunc_call(1);
+    return slot;
+}
+
+/* Cover the object whose address or lvalue is vtop. Globals are not
+ * tracked; stack objects are, so function exit can drop them. */
+static void filc_cover_pushed(int flags, int track)
+{
+    int size, align, slot;
+    if (!filc_on())
+        return;
+    if (vtop->filc_kind == FILC_KIND_SLOT && vtop->filc_slot)
+        return;
+    if ((vtop->type.t & VT_BTYPE) == VT_FUNC)
+        return;
+    size = type_size(&vtop->type, &align);
+    if (size < 0)
+        return;
+    slot = filc_raw_slot();
+    vdup();
+    filc_materialize_addr();
+    vpushs((addr_t)size);
+    vpushi(flags);
+    vpush_helper_func(TOK_filc_cover);
+    vrott(4);
+    gfunc_call(3);
+    filc_store_reg(REG_IRET, VT_PTR, slot);
+    if (track) {
+        filc_push_saved(slot, FILC_KIND_SLOT);
+        vpush_helper_func(TOK_filc_track);
+        vrott(2);
+        gfunc_call(1);
+    }
+    vtop->filc_kind = FILC_KIND_SLOT;
+    vtop->filc_slot = slot;
+    vtop->filc_chk = (vtop->r & VT_LVAL) ? 1 : 0;
+}
+
+static void filc_cover_func(void)
+{
+    int slot;
+    if (!filc_on())
+        return;
+    if (vtop->filc_kind == FILC_KIND_SLOT && vtop->filc_slot)
+        return;
+    slot = filc_raw_slot();
+    vdup();
+    vtop->type.t = VT_PTR;
+    vtop->type.ref = NULL;
+    vtop->filc_kind = 0;
+    vtop->filc_chk = 0;
+    vtop->filc_slot = 0;
+    vpushs(0);
+    vpushi(FILC_F_FUNC);
+    vpush_helper_func(TOK_filc_cover);
+    vrott(4);
+    gfunc_call(3);
+    filc_store_reg(REG_IRET, VT_PTR, slot);
+    vtop->filc_kind = FILC_KIND_SLOT;
+    vtop->filc_slot = slot;
+    vtop->filc_chk = 0;
+}
+
+/* The address on vtop is the object base. Remember it as the lower.
+ * The object was registered by an init record, so this does not call
+ * filc_cover. */
+static void filc_lower_is_addr(void)
+{
+    int slot;
+    if (!filc_on())
+        return;
+    if (vtop->filc_kind == FILC_KIND_SLOT && vtop->filc_slot)
+        return;
+    slot = filc_raw_slot();
+    vdup();
+    filc_materialize_addr();
+    gv(RC_INT);
+    filc_store_reg(vtop->r & VT_VALMASK, VT_PTR, slot);
+    vpop();
+    vtop->filc_kind = FILC_KIND_SLOT;
+    vtop->filc_slot = slot;
+    vtop->filc_chk = (vtop->r & VT_LVAL) ? 1 : 0;
+}
+
+static void filc_bind_sym(Sym *s)
+{
+    int is_local, flags;
+    if (!tcc_state->filc)
+        return;
+    is_local = ((s->r & VT_VALMASK) == VT_LOCAL || (s->r & VT_VALMASK) == VT_LLOCAL)
+        && !(s->r & VT_SYM);
+    if (is_local && s->filc_slot) {
+        vtop->filc_kind = FILC_KIND_SLOT;
+        vtop->filc_slot = s->filc_slot;
+        /* A VLA symbol addresses the slot that holds the payload pointer,
+         * not the payload. Keep the capability, but do not check that slot. */
+        vtop->filc_chk = ((vtop->r & VT_LVAL) && !(s->type.t & VT_VLA)) ? 1 : 0;
+        return;
+    }
+    if ((s->type.t & VT_BTYPE) == VT_FUNC)
+        return;
+    /* Enum constants and other rvalues have no object. Covering them
+     * would register the integer value as an address. */
+    if (!(s->r & VT_SYM) && !is_local)
+        return;
+    /* Defined globals and statics already have an init record. */
+    if (!is_local && (s->r & VT_SYM) && s->a.filc_reg) {
+        filc_lower_is_addr();
+        return;
+    }
+    flags = 0;
+    /* const objects, including const arrays. A plain pointer stays writable
+     * so that `const int *p` does not freeze the pointer variable. */
+    if (filc_obj_readonly(&s->type))
+        flags = FILC_F_READONLY;
+    filc_cover_pushed(flags, 0);
+}
+
+static void filc_bind_local_lvalue(int c)
+{
+    Sym *s;
+    for (s = local_stack; s; s = s->prev) {
+        int size, align;
+        unsigned uc, us, ue;
+        if (!s->filc_slot)
+            continue;
+        if ((s->r & VT_VALMASK) != VT_LOCAL && (s->r & VT_VALMASK) != VT_LLOCAL)
+            continue;
+        if (s->r & VT_SYM)
+            continue;
+        size = type_size(&s->type, &align);
+        if (size <= 0)
+            continue;
+        uc = (unsigned)c;
+        us = (unsigned)s->c;
+        ue = us + (unsigned)size;
+        if (uc >= us && uc < ue) {
+            vtop->filc_kind = FILC_KIND_SLOT;
+            vtop->filc_slot = s->filc_slot;
+            vtop->filc_chk = 1;
+            return;
+        }
+    }
+}
+
+static void filc_after_cast(int sbt, int was_func)
+{
+    int dbt = vtop->type.t & VT_BTYPE;
+    int sb = sbt & VT_BTYPE;
+    if (!tcc_state->filc)
+        return;
+    if (dbt == VT_PTR || dbt == VT_FUNC) {
+        if (was_func && vtop->filc_kind != FILC_KIND_SLOT)
+            filc_cover_func();
+        else if (!(sb == VT_PTR || sb == VT_FUNC || was_func)) {
+            vtop->filc_kind = FILC_KIND_NULL;
+            vtop->filc_slot = 0;
+            vtop->filc_chk = 0;
+        }
+        if (!(vtop->r & VT_LVAL))
+            vtop->filc_chk = 0;
+    } else if (!((vtop->r & VT_LVAL) && vtop->filc_chk)) {
+        /* An integer result carries no capability. A checked lvalue
+         * still has to be checked when it is loaded (`return *p`,
+         * `return a[i]`), so keep that metadata until gv. */
+        vtop->filc_kind = 0;
+        vtop->filc_slot = 0;
+        vtop->filc_chk = 0;
+    }
+}
+
+static void filc_struct_assign(int size)
+{
+    int dslot, sslot, dk, sk, daddr, saddr;
+    CType ty;
+    dk = vtop[-1].filc_kind;
+    dslot = vtop[-1].filc_slot;
+    sk = vtop[0].filc_kind;
+    sslot = vtop[0].filc_slot;
+    vpushv(vtop - 1);
+    filc_materialize_addr();
+    daddr = filc_raw_slot();
+    gv(RC_INT);
+    filc_store_reg(vtop->r & VT_VALMASK, VT_PTR, daddr);
+    vpop();
+    /* A stack argument copy has no lower of its own. Cover it without
+     * tracking: the callee tracks the same address, and the caller
+     * uncovers after the call so the next call cannot reuse stale aux. */
+    if (filc_covering_arg_copy && dk != FILC_KIND_SLOT) {
+        int cslot;
+        CType pty;
+        cslot = filc_raw_slot();
+        pty.t = VT_PTR;
+        pty.ref = NULL;
+        vset(&pty, VT_LOCAL | VT_LVAL, daddr);
+        vpushs((addr_t)size);
+        vpushi(0);
+        vpush_helper_func(TOK_filc_cover);
+        vrott(4);
+        gfunc_call(3);
+        filc_store_reg(REG_IRET, VT_PTR, cslot);
+        if (filc_n_arg_temps >= 16)
+            tcc_error("filc: too many struct arguments");
+        filc_arg_temps[filc_n_arg_temps++] = cslot;
+        dk = FILC_KIND_SLOT;
+        dslot = cslot;
+    }
+    vpushv(vtop);
+    filc_materialize_addr();
+    saddr = filc_raw_slot();
+    gv(RC_INT);
+    filc_store_reg(vtop->r & VT_VALMASK, VT_PTR, saddr);
+    vpop();
+    vpop();
+    ty.t = VT_PTR;
+    ty.ref = NULL;
+    filc_push_saved(dslot, dk);
+    vset(&ty, VT_LOCAL | VT_LVAL, daddr);
+    filc_push_saved(sslot, sk);
+    vset(&ty, VT_LOCAL | VT_LVAL, saddr);
+    vpushs((addr_t)size);
+    vpush_helper_func(TOK_filc_memcpy);
+    vrott(6);
+    gfunc_call(5);
+}
+
+static void filc_spill_cap_here(int slot)
+{
+    int k = vtop->filc_kind;
+    int s = vtop->filc_slot;
+    /* The slot on a pointer lvalue is the object that holds the pointer.
+     * The capability that has to reach the other side of a conditional is
+     * the one stored in the pointer, which dies with this frame if we
+     * publish the local instead. */
+    if ((vtop->r & VT_LVAL) && vtop->filc_chk) {
+        int bt = vtop->type.t & VT_BTYPE;
+        if ((bt == VT_PTR || bt == VT_FUNC) && !(vtop->type.t & (VT_ARRAY | VT_VLA))) {
+            s = filc_capture_load_cap();
+            k = FILC_KIND_SLOT;
+        }
+    }
+    filc_push_saved(s, k);
+    /* char* has a real pointed-to type. A VT_PTR with a null ref
+     * makes vstore's cast check dereference that ref. */
+    vtop->type = char_pointer_type;
+    vset(&char_pointer_type, VT_LOCAL | VT_LVAL, slot);
+    vswap();
+    vstore();
+    vpop();
+}
+
+static void filc_set_return_cap(void)
+{
+    int kind = vtop->filc_kind;
+    int slot = vtop->filc_slot;
+    int r = vtop->r & VT_VALMASK;
+    int t = vtop->type.t;
+    int tmp;
+    if (r >= VT_CONST)
+        return;
+    tmp = filc_slot_for(t);
+    filc_store_reg(r, t, tmp);
+    filc_push_saved(slot, kind);
+    vpush_helper_func(TOK_filc_set_ret);
+    vrott(2);
+    gfunc_call(1);
+    filc_load_reg(r, t, tmp);
+}
+
+/* Pointer-aligned pointer fields, including nested structs and arrays.
+ * Unions contribute one slot per distinct offset: the aux word itself. */
+static void filc_collect_ptr_offs(CType *type, int base, int *offs, int *n, int maxn)
+{
+    int bt;
+    if (type->t & VT_BITFIELD)
+        return;
+    if (type->t & VT_ARRAY) {
+        int es, ea, i, count;
+        CType *et;
+        if (!type->ref)
+            return;
+        et = &type->ref->type;
+        es = type_size(et, &ea);
+        count = type->ref->c;
+        if (es <= 0 || count <= 0)
+            return;
+        for (i = 0; i < count; i++)
+            filc_collect_ptr_offs(et, base + i * es, offs, n, maxn);
+        return;
+    }
+    bt = type->t & VT_BTYPE;
+    if (bt == VT_PTR || bt == VT_FUNC) {
+        int i;
+        if (base & (PTR_SIZE - 1))
+            return;
+        for (i = 0; i < *n; i++)
+            if (offs[i] == base)
+                return;
+        if (*n >= maxn)
+            tcc_error("filc: too many pointers in a register struct");
+        offs[(*n)++] = base;
+        return;
+    }
+    if (bt == VT_STRUCT && type->ref) {
+        Sym *f;
+        for (f = type->ref->next; f; f = f->next)
+            filc_collect_ptr_offs(&f->type, base + f->c, offs, n, maxn);
+    }
+}
+
+static int filc_ptr_slot_count(CType *type)
+{
+    int offs[8], n = 0;
+    filc_collect_ptr_offs(type, 0, offs, &n, 8);
+    return n;
+}
+
+/* vtop is a struct. Record one lower per pointer slot into out[].
+ * A missing source capability becomes a null lower. */
+static int filc_snap_struct_caps(int *out, int maxn)
+{
+    int offs[8];
+    int n = 0, i, kind, slot, base;
+    filc_collect_ptr_offs(&vtop->type, 0, offs, &n, 8);
+    if (n > maxn)
+        n = maxn;
+    for (i = 0; i < n; i++)
+        out[i] = 0;
+    kind = vtop->filc_kind;
+    slot = vtop->filc_slot;
+    if (n == 0 || kind != FILC_KIND_SLOT || !slot || !(vtop->r & VT_LVAL))
+        return n;
+    vdup();
+    filc_materialize_addr();
+    base = filc_raw_slot();
+    gv(RC_INT);
+    filc_store_reg(vtop->r & VT_VALMASK, VT_PTR, base);
+    vpop();
+    for (i = 0; i < n; i++) {
+        int cs = filc_raw_slot();
+        /* Byte pointer: gen_op('+') scales by the pointed size, and a
+         * VT_PTR with a null ref would crash in pointed_type. */
+        vset(&char_pointer_type, VT_LOCAL | VT_LVAL, base);
+        if (offs[i]) {
+            vpushi(offs[i]);
+            gen_op('+');
+        }
+        filc_push_saved(slot, kind);
+        vswap();
+        vpush_helper_func(TOK_filc_load_cap);
+        vrott(3);
+        gfunc_call(2);
+        filc_store_reg(REG_IRET, VT_PTR, cs);
+        out[i] = cs;
+    }
+    return n;
+}
+
+static void filc_pull_cap_field(int idx, int obj_slot, int addr_off)
+{
+    int tmp;
+    vpushi(idx);
+    vpush_helper_func(TOK_filc_call_get);
+    vrott(2);
+    gfunc_call(1);
+    tmp = filc_raw_slot();
+    filc_store_reg(REG_IRET, VT_PTR, tmp);
+    filc_emit_store_cap_direct(obj_slot, addr_off, FILC_KIND_SLOT, tmp);
+}
+
+/* First variadic pointer cap. Named params already consumed ptr_i. */
+static void filc_emit_va_cursor(int ptr_i)
+{
+    if (!func_var)
+        return;
+    vpushi(ptr_i);
+    vpush_helper_func(TOK_filc_va_cursor);
+    vrott(2);
+    gfunc_call(1);
+}
+
+static void filc_func_enter(Sym *func)
+{
+    Sym *arg;
+    int ptr_i = 0, seen_int = 0, argc_off = 0, is_main, ireg = 0, sreg = 0;
+    int mem_sret;
+    CType ty, sret_ty;
+
+    filc_sret_slot = 0;
+    filc_mark_slot = filc_raw_slot();
+    vpush_helper_func(TOK_filc_track_mark);
+    gfunc_call(0);
+    filc_store_reg(REG_IRET, VT_PTR, filc_mark_slot);
+
+    is_main = funcname && !strcmp(funcname, "main");
+    ty.t = VT_PTR;
+    ty.ref = NULL;
+    mem_sret = 0;
+    if ((func_vt.t & VT_BTYPE) == VT_STRUCT) {
+        int align, regsize;
+        mem_sret = gfunc_sret(&func_vt, func_var, &sret_ty, &align, &regsize) == 0;
+    }
+    /* Memory sret's hidden pointer is capability index 0 and the first
+     * integer register. The caller's object is already covered. */
+    if (mem_sret && !is_main) {
+        vpushi(0);
+        vpush_helper_func(TOK_filc_call_get);
+        vrott(2);
+        gfunc_call(1);
+        filc_sret_slot = filc_raw_slot();
+        filc_store_reg(REG_IRET, VT_PTR, filc_sret_slot);
+        ptr_i = 1;
+        ireg = 1;
+    } else if (mem_sret && is_main) {
+        /* The hidden pointer is saved at func_vc. A real caller passes a
+         * buffer. The CRT calls main(argc, argv), so the slot holds a small
+         * integer. Covering that and storing through it would write off into
+         * nowhere. Point the return at a local buffer in that case, and do
+         * not track either object: the caller owns a real buffer, and this
+         * local only has to stay covered until the return store. */
+        int size, align, pslot, buf, jmp, r;
+        CType pty;
+        size = type_size(&func_vt, &align);
+        if (size < 0)
+            size = 0;
+        if (align < 16)
+            align = 16;
+        loc = (loc - size) & -align;
+        buf = loc;
+        pty.t = VT_PTR;
+        pty.ref = NULL;
+        vset(&pty, VT_LOCAL | VT_LVAL, func_vc);
+        gv(RC_INT);
+        pslot = filc_raw_slot();
+        filc_store_reg(vtop->r & VT_VALMASK, VT_PTR, pslot);
+        vpop();
+        vset(&pty, VT_LOCAL | VT_LVAL, pslot);
+        gen_cast_s(VT_SIZE_T);
+        vpushi(65536);
+        gen_op(TOK_LT);
+        jmp = gvtst(1, 0);
+        /* Raw stores: vstore type-checks a pointer and needs a real ref. */
+        vset(&pty, VT_LOCAL, buf);
+        r = gv(RC_INT);
+        filc_store_reg(r, VT_PTR, pslot);
+        filc_store_reg(r, VT_PTR, func_vc);
+        vpop();
+        gsym(jmp);
+        vset(&pty, VT_LOCAL | VT_LVAL, pslot);
+        vpushs((addr_t)size);
+        vpushi(0);
+        vpush_helper_func(TOK_filc_cover);
+        vrott(4);
+        gfunc_call(3);
+        filc_sret_slot = filc_raw_slot();
+        filc_store_reg(REG_IRET, VT_PTR, filc_sret_slot);
+    }
+    if (!func->type.ref) {
+        filc_emit_va_cursor(ptr_i);
+        return;
+    }
+    for (arg = func->type.ref->next; arg; arg = arg->next) {
+        Sym *s;
+        CType *at;
+        int size, align, slot, bt, anon, inreg;
+        anon = (arg->v & ~SYM_STRUCT) >= SYM_FIRST_ANOM;
+        s = anon ? NULL : sym_find(arg->v);
+        at = s ? &s->type : &arg->type;
+        inreg = gfunc_arg_inreg(at, &ireg, &sreg);
+        bt = at->t & VT_BTYPE;
+        if (!s) {
+            if (bt == VT_STRUCT && inreg)
+                ptr_i += filc_ptr_slot_count(at);
+            else if (bt == VT_PTR && !(at->t & VT_ARRAY))
+                ptr_i++;
+            continue;
+        }
+        size = type_size(&s->type, &align);
+        if (size < 0)
+            size = 0;
+        slot = filc_cover_stack_addr(s->c, size, 0);
+        s->filc_slot = slot;
+        if (bt == VT_STRUCT && inreg && !is_main) {
+            int offs[8], n = 0, i;
+            filc_collect_ptr_offs(&s->type, 0, offs, &n, 8);
+            for (i = 0; i < n; i++)
+                filc_pull_cap_field(ptr_i++, slot, s->c + offs[i]);
+        } else if (bt == VT_PTR && !(s->type.t & VT_ARRAY)) {
+            if (is_main && seen_int && ptr_i == 0) {
+                int tmp;
+                vset(&int_type, VT_LOCAL | VT_LVAL, argc_off);
+                vset(&ty, VT_LOCAL | VT_LVAL, s->c);
+                vpush_helper_func(TOK_filc_enter_main);
+                vrott(3);
+                gfunc_call(2);
+                tmp = filc_raw_slot();
+                filc_store_reg(REG_IRET, VT_PTR, tmp);
+                filc_emit_store_cap_direct(slot, s->c, FILC_KIND_SLOT, tmp);
+            } else if (!is_main) {
+                int tmp;
+                vpushi(ptr_i);
+                vpush_helper_func(TOK_filc_call_get);
+                vrott(2);
+                gfunc_call(1);
+                tmp = filc_raw_slot();
+                filc_store_reg(REG_IRET, VT_PTR, tmp);
+                filc_emit_store_cap_direct(slot, s->c, FILC_KIND_SLOT, tmp);
+            }
+            ptr_i++;
+        } else if (bt == VT_INT || bt == VT_LLONG) {
+            if (!seen_int) {
+                seen_int = 1;
+                argc_off = s->c;
+            }
+        }
+    }
+    filc_emit_va_cursor(ptr_i);
+}
+
+/* Drop stack objects tracked after `slot`. A return value may already
+ * sit in rax/xmm0 (fall-through return), so spill those around the call. */
+/* `slot` is the label's frame key, not a stored depth. A goto that
+ * reaches the label before the label has run must not untrack. */
+static void filc_untrack_mark(int slot)
+{
+    int ival, fval;
+    CType ty;
+    if (!filc_on() || !slot)
+        return;
+    ival = filc_raw_slot();
+    fval = filc_raw_slot();
+    filc_store_reg(REG_IRET, VT_PTR, ival);
+    filc_store_reg(REG_FRET, VT_DOUBLE, fval);
+    ty.t = VT_PTR;
+    ty.ref = NULL;
+    vset(&ty, VT_LOCAL, slot);
+    vpush_helper_func(TOK_filc_label_untrack);
+    vrott(2);
+    gfunc_call(1);
+    filc_load_reg(REG_IRET, VT_PTR, ival);
+    filc_load_reg(REG_FRET, VT_DOUBLE, fval);
+}
+
+static void filc_func_leave(void)
+{
+    int ival, fval;
+#ifdef TCC_TARGET_X86_64
+    int ival2, fval2;
+#endif
+    if (!filc_mark_slot)
+        return;
+    /* filc_untrack_to is a normal call, so it clobbers the registers the
+       function is about to return in. Spill them around it. Slots allocated
+       here are inside the frame: the epilog sizes rsp from the final loc.
+       long double (x87 st0) is not spilled. A 16-byte struct return also
+       uses rdx / xmm1. */
+    ival = filc_raw_slot();
+    fval = filc_raw_slot();
+    filc_store_reg(REG_IRET, VT_PTR, ival);
+    filc_store_reg(REG_FRET, VT_DOUBLE, fval);
+#ifdef TCC_TARGET_X86_64
+    ival2 = filc_raw_slot();
+    fval2 = filc_raw_slot();
+    filc_store_reg(REG_IRE2, VT_PTR, ival2);
+    filc_store_reg(REG_FRE2, VT_DOUBLE, fval2);
+#endif
+    vpush_helper_func(TOK_filc_label_clear);
+    gfunc_call(0);
+    filc_push_saved(filc_mark_slot, FILC_KIND_SLOT);
+    vpush_helper_func(TOK_filc_untrack_to);
+    vrott(2);
+    gfunc_call(1);
+    filc_load_reg(REG_IRET, VT_PTR, ival);
+    filc_load_reg(REG_FRET, VT_DOUBLE, fval);
+#ifdef TCC_TARGET_X86_64
+    filc_load_reg(REG_IRE2, VT_PTR, ival2);
+    filc_load_reg(REG_FRE2, VT_DOUBLE, fval2);
+#endif
+    filc_mark_slot = 0;
+}
+
+static int filc_is_yolo(const char *name)
+{
+    static const char *const names[] = {
+        "exit", "_exit", "abort",
+        "setjmp", "_setjmp", "sigsetjmp", "__sigsetjmp",
+        "longjmp", "_longjmp", "siglongjmp",
+        "alloca",
+        NULL
+    };
+    int i;
+    if (!name)
+        return 0;
+    for (i = 0; names[i]; i++)
+        if (!strcmp(name, names[i]))
+            return 1;
+    return 0;
+}
+
+struct filc_saved_arg {
+    int slot, kind, cap;
+    CType type;
+};
+static struct filc_saved_arg filc_sv[64];
+
+static void filc_spill_call(int nb)
+{
+    int i;
+    if (nb > 64)
+        tcc_error("filc: too many arguments");
+    for (i = nb - 1; i >= 0; i--) {
+        int depth = nb - i;
+        if (depth != 1)
+            vrotb(depth);
+        if ((vtop->r & VT_LVAL) || (vtop->r & VT_VALMASK) >= VT_CONST) {
+            int bt = vtop->type.t & VT_BTYPE;
+            int rc = RC_INT;
+            if (bt == VT_FLOAT || bt == VT_DOUBLE || bt == VT_LDOUBLE)
+                rc = RC_FLOAT;
+            gv(rc);
+        }
+        filc_sv[i].kind = vtop->filc_kind;
+        filc_sv[i].cap = vtop->filc_slot;
+        filc_sv[i].type = vtop->type;
+        /* A variadic array is not decayed by gfunc_param_typed. gv()
+         * already loaded its address. Keep that pointer, not the array. */
+        if (filc_sv[i].type.t & (VT_ARRAY | VT_VLA))
+            filc_sv[i].type.t &= ~(VT_ARRAY | VT_VLA);
+        if ((filc_sv[i].type.t & VT_BTYPE) == VT_STRUCT)
+            tcc_error("filc: struct argument to a checked call is not supported");
+        filc_sv[i].slot = filc_slot_for(filc_sv[i].type.t);
+        filc_store_reg(vtop->r & VT_VALMASK, filc_sv[i].type.t, filc_sv[i].slot);
+        if (depth != 1)
+            vrott(depth);
+    }
+    for (i = 0; i < nb + 1; i++)
+        vpop();
+}
+
+static void filc_push_ival(int i)
+{
+    vset(&filc_sv[i].type, VT_LOCAL | VT_LVAL, filc_sv[i].slot);
+}
+
+static void filc_push_caparg(int i)
+{
+    filc_push_saved(filc_sv[i].cap, filc_sv[i].kind);
+}
+
+static void filc_finish_intercept(int tok, int nargs)
+{
+    vpush_helper_func(tok);
+    vrott(nargs + 1);
+}
+
+/* A decayed array is still the object's address. classify_x86_64_arg
+ * passes VT_ARRAY as an 8-byte integer, so it is a pointer argument. */
+static int filc_is_ptr_arg(int t)
+{
+    int bt = t & VT_BTYPE;
+    if (t & (VT_ARRAY | VT_VLA))
+        return 1;
+    return bt == VT_PTR || bt == VT_FUNC;
+}
+
+/* Check the format, then the caller rebuilds the real call.
+ * is_v skips the argument walk: a va_list hides each %s and %n. */
+static void filc_emit_fmt(int fmt_i, int var_i, int nb, int is_v)
+{
+    int i;
+    filc_push_caparg(fmt_i);
+    filc_push_ival(fmt_i);
+    filc_finish_intercept(TOK_filc_fmt_begin, 2);
+    gfunc_call(2);
+    if (is_v)
+        return;
+    for (i = var_i; i < nb; i++) {
+        if (filc_is_ptr_arg(filc_sv[i].type.t)) {
+            filc_push_caparg(i);
+            filc_push_ival(i);
+            filc_finish_intercept(TOK_filc_fmt_ptr, 2);
+            gfunc_call(2);
+        } else {
+            vpush_helper_func(TOK_filc_fmt_skip);
+            gfunc_call(0);
+        }
+    }
+    vpush_helper_func(TOK_filc_fmt_end);
+    gfunc_call(0);
+}
+
+static void filc_repush(Sym *sym, int nb)
+{
+    int i;
+    vpushsym(&func_old_type, sym);
+    for (i = 0; i < nb; i++)
+        filc_push_ival(i);
+}
+
+static int filc_passthru(int tok, int nb, int *pnb)
+{
+    int i;
+    filc_spill_call(nb);
+    for (i = 0; i < nb; i++)
+        filc_push_ival(i);
+    filc_finish_intercept(tok, nb);
+    *pnb = nb;
+    return 1;
+}
+
+/* Destination is argument 0. One extra lower is its capability. */
+static void filc_repush_buf(int tok, int has_sz, int sz, int fmt, int var0,
+    int nb, int *pnb)
+{
+    int i, n;
+    filc_push_caparg(0);
+    filc_push_ival(0);
+    n = 2;
+    if (has_sz) {
+        filc_push_ival(sz);
+        n++;
+    }
+    filc_push_ival(fmt);
+    n++;
+    for (i = var0; i < nb; i++) {
+        filc_push_ival(i);
+        n++;
+    }
+    filc_finish_intercept(tok, n);
+    *pnb = n;
+}
+
+/* Case-insensitive scans and stat. A match keeps the haystack cap. */
+static int filc_try_bytes(const char *name, int *pnb)
+{
+    int nb = *pnb;
+    int tok;
+    if (!strcmp(name, "strcasecmp") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_strcasecmp, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "strncasecmp") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_strncasecmp, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "strcasestr") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_strcasestr, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "memmem") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_memmem, 6);
+        *pnb = 6;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if ((!strcmp(name, "stat") || !strcmp(name, "lstat")) && nb == 2) {
+        tok = name[0] == 'l' ? TOK_filc_lstat : TOK_filc_stat;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(tok, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "fstat") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(1);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_fstat, 3);
+        *pnb = 3;
+        return 1;
+    }
+    return 0;
+}
+
+/* qsort's comparator gets the array capability. bsearch may return an
+ * interior pointer, so the cap is the array rather than a new object. */
+static int filc_try_sort(const char *name, int *pnb)
+{
+    int nb = *pnb;
+    if (!strcmp(name, "qsort") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_caparg(3);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_qsort, 6);
+        *pnb = 6;
+        return 1;
+    }
+    if (!strcmp(name, "bsearch") && nb == 5) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_push_caparg(4);
+        filc_push_ival(4);
+        filc_finish_intercept(TOK_filc_bsearch, 8);
+        *pnb = 8;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    return 0;
+}
+
+/* printf family, stdio passthroughs, and mmap. Returns 1 if rewritten.
+ * Direct printf/fprintf/dprintf keep the libc symbol after the checks.
+ * *sprintf goes to filc_* so the destination size is enforced. */
+static int filc_try_stdio(const char *name, int *pnb, Sym *sym)
+{
+    int nb, fmt_i, var0, is_v, tok, has_sz, sz, i;
+    nb = *pnb;
+    if (!strcmp(name, "fclose") && nb == 1)
+        return filc_passthru(TOK_filc_fclose, nb, pnb);
+    if (!strcmp(name, "fflush") && nb == 1)
+        return filc_passthru(TOK_filc_fflush, nb, pnb);
+    if (!strcmp(name, "close") && nb == 1)
+        return filc_passthru(TOK_filc_close, nb, pnb);
+    if (!strcmp(name, "lseek") && nb == 3)
+        return filc_passthru(TOK_filc_lseek, nb, pnb);
+    if ((!strcmp(name, "fputc") || !strcmp(name, "putc")) && nb == 2)
+        return filc_passthru(TOK_filc_fputc, nb, pnb);
+    if (!strcmp(name, "putchar") && nb == 1)
+        return filc_passthru(TOK_filc_putchar, nb, pnb);
+    if (!strcmp(name, "perror") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_perror, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if (!strcmp(name, "mmap") && nb == 6) {
+        filc_spill_call(nb);
+        for (i = 0; i < nb; i++)
+            filc_push_ival(i);
+        filc_finish_intercept(TOK_filc_mmap, nb);
+        *pnb = nb;
+        filc_ret_mode = FILC_RET_PTR;
+        return 1;
+    }
+    if (!strcmp(name, "munmap") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_munmap, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "mprotect") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_mprotect, 4);
+        *pnb = 4;
+        return 1;
+    }
+    fmt_i = 0;
+    var0 = 0;
+    is_v = 0;
+    tok = 0;
+    has_sz = 0;
+    sz = 0;
+    if (!strcmp(name, "printf") && nb >= 1) {
+        fmt_i = 0;
+        var0 = 1;
+    } else if (!strcmp(name, "fprintf") && nb >= 2) {
+        fmt_i = 1;
+        var0 = 2;
+    } else if (!strcmp(name, "dprintf") && nb >= 2) {
+        fmt_i = 1;
+        var0 = 2;
+    } else if (!strcmp(name, "sprintf") && nb >= 2) {
+        fmt_i = 1;
+        var0 = 2;
+        tok = TOK_filc_sprintf;
+    } else if (!strcmp(name, "snprintf") && nb >= 3) {
+        fmt_i = 2;
+        var0 = 3;
+        tok = TOK_filc_snprintf;
+        has_sz = 1;
+        sz = 1;
+    } else if (!strcmp(name, "vprintf") && nb == 2) {
+        fmt_i = 0;
+        is_v = 1;
+    } else if (!strcmp(name, "vfprintf") && nb == 3) {
+        fmt_i = 1;
+        is_v = 1;
+    } else if (!strcmp(name, "vsprintf") && nb == 3) {
+        fmt_i = 1;
+        var0 = 2;
+        is_v = 1;
+        tok = TOK_filc_vsprintf;
+    } else if (!strcmp(name, "vsnprintf") && nb == 4) {
+        fmt_i = 2;
+        var0 = 3;
+        is_v = 1;
+        tok = TOK_filc_vsnprintf;
+        has_sz = 1;
+        sz = 1;
+    } else {
+        return 0;
+    }
+    if (!tok && !sym)
+        return 0;
+    filc_spill_call(nb);
+    filc_emit_fmt(fmt_i, var0, nb, is_v);
+    if (tok)
+        filc_repush_buf(tok, has_sz, sz, fmt_i, var0, nb, pnb);
+    else {
+        filc_repush(sym, nb);
+        *pnb = nb;
+    }
+    return 1;
+}
+
+/* Rewrite a direct libc call. Returns 1 if the call was rewritten.
+ * *pnb is the new argument count. */
+static int filc_intercept(const char *name, int *pnb, int ret_ptr)
+{
+    int nb = *pnb;
+    SValue *fn = vtop - nb;
+    int tok = 0, mode = FILC_RET_NONE;
+    if (!name)
+        return 0;
+    if (!strcmp(name, "malloc")) {
+        tok = TOK_filc_malloc;
+        mode = FILC_RET_PTR;
+    } else if (!strcmp(name, "calloc")) {
+        tok = TOK_filc_calloc;
+        mode = FILC_RET_PTR;
+    }
+    /* strdup takes an extra lower; it is rebuilt below, not swapped in place. */
+    if (tok && (nb == 1 || (tok == TOK_filc_calloc && nb == 2))) {
+        fn->sym = external_helper_sym(tok);
+        filc_ret_mode = mode;
+        return 1;
+    }
+    tok = 0;
+    if (!strcmp(name, "free") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_free, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if (!strcmp(name, "realloc") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_realloc, 3);
+        *pnb = 3;
+        filc_ret_mode = FILC_RET_PTR;
+        return 1;
+    }
+    if ((!strcmp(name, "memcpy") || !strcmp(name, "memmove")) && nb == 3) {
+        /* "memmove"[3] == 'm'; "memcpy"[3] == 'c'. */
+        tok = name[3] == 'm' ? TOK_filc_memmove : TOK_filc_memcpy;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(tok, 5);
+        *pnb = 5;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "memset") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_memset, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "strlen") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_strlen, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if ((!strcmp(name, "strchr") || !strcmp(name, "strrchr")) && nb == 2) {
+        tok = name[3] == 'r' ? TOK_filc_strrchr : TOK_filc_strchr;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(tok, 3);
+        *pnb = 3;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "strstr") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_strstr, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if ((!strcmp(name, "strcmp") && nb == 2) || (!strcmp(name, "strncmp") && nb == 3)) {
+        int n = nb;
+        tok = n == 3 ? TOK_filc_strncmp : TOK_filc_strcmp;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        if (n == 3)
+            filc_push_ival(2);
+        filc_finish_intercept(tok, n == 3 ? 5 : 4);
+        *pnb = n == 3 ? 5 : 4;
+        return 1;
+    }
+    if (!strcmp(name, "memchr") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_memchr, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "strdup") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_strdup, 2);
+        *pnb = 2;
+        filc_ret_mode = FILC_RET_PTR;
+        return 1;
+    }
+    if ((!strcmp(name, "strcpy") || !strcmp(name, "strcat")) && nb == 2) {
+        /* strcpy[4] == 'p'; strcat[4] == 'a'. */
+        tok = name[4] == 'a' ? TOK_filc_strcat : TOK_filc_strcpy;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(tok, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if ((!strcmp(name, "strncpy") || !strcmp(name, "strncat")) && nb == 3) {
+        /* strncpy[5] == 'p'; strncat[5] == 'a'. */
+        tok = name[5] == 'p' ? TOK_filc_strncpy : TOK_filc_strncat;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(tok, 5);
+        *pnb = 5;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "strnlen") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_strnlen, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "memcmp") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_memcmp, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "strndup") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_strndup, 3);
+        *pnb = 3;
+        filc_ret_mode = FILC_RET_PTR;
+        return 1;
+    }
+    if (!strcmp(name, "stpcpy") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_stpcpy, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "stpncpy") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_stpncpy, 5);
+        *pnb = 5;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if ((!strcmp(name, "strspn") || !strcmp(name, "strcspn")) && nb == 2) {
+        /* strspn[3] == 's'; strcspn[3] == 'c'. */
+        tok = name[3] == 'c' ? TOK_filc_strcspn : TOK_filc_strspn;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(tok, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "strpbrk") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_strpbrk, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "memccpy") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_memccpy, 6);
+        *pnb = 6;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if ((!strcmp(name, "bzero") || !strcmp(name, "explicit_bzero")) && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_explicit_bzero, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "strtok") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_strtok, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "strtok_r") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_strtok_r, 6);
+        *pnb = 6;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "strsep") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_strsep, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if ((!strcmp(name, "read") || !strcmp(name, "write")) && nb == 3) {
+        /* read[0] == 'r'; write[0] == 'w'. The buffer is argument 1. */
+        tok = name[0] == 'w' ? TOK_filc_write : TOK_filc_read;
+        filc_spill_call(nb);
+        filc_push_caparg(1);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(tok, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if ((!strcmp(name, "pread") || !strcmp(name, "pwrite")) && nb == 4) {
+        /* pread[1] == 'r'; pwrite[1] == 'w'. */
+        tok = name[1] == 'w' ? TOK_filc_pwrite : TOK_filc_pread;
+        filc_spill_call(nb);
+        filc_push_caparg(1);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(tok, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if ((!strcmp(name, "fread") || !strcmp(name, "fwrite")) && nb == 4) {
+        /* fread[1] == 'r'; fwrite[1] == 'w'. FILE* is raw pointer bits. */
+        tok = name[1] == 'w' ? TOK_filc_fwrite : TOK_filc_fread;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(tok, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "fgets") && nb == 3) {
+        /* The returned pointer may be interior, so the cap is the buffer. */
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_fgets, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if ((!strcmp(name, "getenv") || !strcmp(name, "secure_getenv")) && nb == 1) {
+        /* lower == the returned string. secure_getenv[0] == 's'. */
+        tok = name[0] == 's' ? TOK_filc_secure_getenv : TOK_filc_getenv;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(tok, 2);
+        *pnb = 2;
+        filc_ret_mode = FILC_RET_PTR;
+        return 1;
+    }
+    if (!strcmp(name, "setenv") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_setenv, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "unsetenv") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_unsetenv, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if (!strcmp(name, "putenv") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_putenv, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if (!strcmp(name, "open") && (nb == 2 || nb == 3)) {
+        /* The mode argument is optional. has_mode selects the libc call. */
+        int has = nb == 3;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        if (has)
+            filc_push_ival(2);
+        else
+            vpushi(0);
+        vpushi(has);
+        filc_finish_intercept(TOK_filc_open, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "fopen") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_fopen, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "freopen") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_freopen, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "fdopen") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_fdopen, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "puts") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_puts, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if (!strcmp(name, "fputs") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_fputs, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (filc_try_bytes(name, pnb))
+        return 1;
+    if (filc_try_sort(name, pnb))
+        return 1;
+    if (filc_try_stdio(name, pnb, fn->sym))
+        return 1;
+    if (!strcmp(name, "filc_va_start") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_va_start, 2);
+        *pnb = 2;
+        return 1;
+    }
+    (void)ret_ptr;
+    return 0;
+}
+
+static void filc_check_indirect(int nb)
+{
+    int k, s, ps, r;
+    int depth = nb + 1;
+    if (depth != 1)
+        vrotb(depth);
+    if ((vtop->r & VT_LVAL) || (vtop->r & VT_VALMASK) >= VT_CONST)
+        gv(RC_INT);
+    k = vtop->filc_kind;
+    s = vtop->filc_slot;
+    /* The check call clobbers caller-saved registers. Keep the function
+     * pointer in a frame slot so the later call still has it. */
+    r = vtop->r & VT_VALMASK;
+    ps = filc_raw_slot();
+    if (r >= VT_CONST)
+        gv(RC_INT);
+    filc_store_reg(vtop->r & VT_VALMASK, VT_PTR, ps);
+    vtop->r = VT_LOCAL | VT_LVAL;
+    vtop->c.i = ps;
+    vtop->sym = NULL;
+    vtop->filc_kind = k;
+    vtop->filc_slot = s;
+    vdup();
+    vtop->type.t = VT_PTR;
+    vtop->type.ref = NULL;
+    vtop->filc_kind = 0;
+    vtop->filc_chk = 0;
+    vtop->filc_slot = 0;
+    filc_push_saved(s, k);
+    vswap();
+    vpush_helper_func(TOK_filc_check_func);
+    vrott(3);
+    gfunc_call(2);
+    if (depth != 1)
+        vrott(depth);
+}
+
+/* Indirect libc calls keep the standard signature. If fn is a known
+ * libc address, call the entry that reads the capability frame already
+ * pushed. The adapted pointer lives in a slot so later calls cannot
+ * clobber it. gcall_or_jmp loads a VT_FUNC lvalue as a 64-bit pointer. */
+static void filc_adapt_indirect(int nb)
+{
+    int depth = nb + 1;
+    int slot;
+    if (depth != 1)
+        vrotb(depth);
+    vdup();
+    vtop->filc_kind = 0;
+    vtop->filc_slot = 0;
+    vtop->filc_chk = 0;
+    vtop->type.t = VT_PTR;
+    vtop->type.ref = NULL;
+    vpush_helper_func(TOK_filc_adapt);
+    vrott(2);
+    gfunc_call(1);
+    slot = filc_raw_slot();
+    filc_store_reg(REG_IRET, VT_PTR, slot);
+    vtop->r = VT_LOCAL | VT_LVAL;
+    vtop->c.i = slot;
+    vtop->sym = NULL;
+    vtop->filc_kind = 0;
+    vtop->filc_slot = 0;
+    vtop->filc_chk = 0;
+    if (depth != 1)
+        vrott(depth);
+}
+
+/* Record the jmp_buf lower before the real setjmp. A wrapper cannot
+ * call setjmp: the second return would land in a dead frame. */
+static int filc_try_setjmp(const char *name, int nb)
+{
+    int kind, depth, k, s, ps;
+    if (!strcmp(name, "setjmp") || !strcmp(name, "_setjmp")) {
+        if (nb != 1)
+            return 0;
+        kind = 0;
+    } else if (!strcmp(name, "sigsetjmp") || !strcmp(name, "__sigsetjmp")) {
+        if (nb != 2)
+            return 0;
+        kind = 1;
+    } else {
+        return 0;
+    }
+    depth = nb;
+    if (depth != 1)
+        vrotb(depth);
+    /* The anchor call clobbers caller-saved registers. Spill the jmp
+     * pointer so the real setjmp still receives it. */
+    if ((vtop->r & VT_LVAL) || (vtop->r & VT_VALMASK) >= VT_CONST)
+        gv(RC_INT);
+    k = vtop->filc_kind;
+    s = vtop->filc_slot;
+    ps = filc_slot_for(VT_PTR);
+    filc_store_reg(vtop->r & VT_VALMASK, VT_PTR, ps);
+    vtop->r = VT_LOCAL | VT_LVAL;
+    vtop->c.i = ps;
+    vtop->sym = NULL;
+    vtop->filc_kind = k;
+    vtop->filc_slot = s;
+    vdup();
+    vtop->filc_kind = 0;
+    vtop->filc_chk = 0;
+    vtop->filc_slot = 0;
+    vtop->type.t = VT_PTR;
+    vtop->type.ref = NULL;
+    filc_push_saved(s, k);
+    vswap();
+    vpushi(kind);
+    vpush_helper_func(TOK_filc_setjmp_anchor);
+    vrott(4);
+    gfunc_call(3);
+    if (depth != 1)
+        vrott(depth);
+    return 1;
+}
+
+static int filc_try_longjmp(SValue *fn, const char *name, int nb)
+{
+    int tok = 0;
+    if (nb != 2)
+        return 0;
+    if (!strcmp(name, "longjmp"))
+        tok = TOK_filc_longjmp;
+    else if (!strcmp(name, "_longjmp"))
+        tok = TOK_filc__longjmp;
+    else if (!strcmp(name, "siglongjmp"))
+        tok = TOK_filc_siglongjmp;
+    else
+        return 0;
+    fn->sym = external_helper_sym(tok);
+    fn->c.i = 0;
+    return 1;
+}
+
+/* Save the byte count, then let the real alloca adjust this frame.
+ * The result is covered in filc_after_call. Do not clear the slot here
+ * on other calls: the cover helper is not named alloca. */
+static int filc_try_alloca(const char *name, int nb)
+{
+    int sl;
+    if (strcmp(name, "alloca") || nb != 1)
+        return 0;
+    vdup();
+    gen_cast_s(VT_SIZE_T);
+    if ((vtop->r & VT_LVAL) || (vtop->r & VT_VALMASK) >= VT_CONST)
+        gv(RC_INT);
+    sl = filc_slot_for(VT_SIZE_T);
+    filc_store_reg(vtop->r & VT_VALMASK, VT_SIZE_T, sl);
+    vpop();
+    filc_alloca_size_slot = sl;
+    return 1;
+}
+
+/* sret_cap is the covered lower of a memory struct return, passed as
+ * capability index 0. Zero means this call has no hidden sret pointer.
+ * Register structs contribute one capability per pointer slot. Memory
+ * structs do not: their stack copy carries aux. */
+static void filc_pass_arg_caps(int nb, int sret_cap)
+{
+    int i, pi, ncap, ireg, sreg, base;
+    int cap_slot[32];
+    if (nb > 64)
+        tcc_error("filc: too many arguments");
+    for (i = 0; i < 32; i++)
+        cap_slot[i] = 0;
+    ncap = 0;
+    ireg = 0;
+    sreg = 0;
+    base = 0;
+    if (sret_cap) {
+        ireg = 1;
+        base = 1;
+        cap_slot[ncap++] = sret_cap;
+    }
+    for (i = base; i < nb; i++) {
+        SValue *a = vtop - nb + 1 + i;
+        int bt = a->type.t & VT_BTYPE;
+        int inreg = gfunc_arg_inreg(&a->type, &ireg, &sreg);
+        int is_ptr = (bt == VT_PTR || bt == VT_FUNC);
+        int is_st = (bt == VT_STRUCT);
+        if (is_st && inreg) {
+            int depth = nb - i;
+            int slots[8], n, k;
+            if (depth != 1)
+                vrotb(depth);
+            n = filc_snap_struct_caps(slots, 8);
+            if (depth != 1)
+                vrott(depth);
+            for (k = 0; k < n; k++) {
+                if (ncap >= 32)
+                    tcc_error("filc: too many pointer arguments");
+                cap_slot[ncap++] = slots[k];
+            }
+        } else if (is_ptr) {
+            int depth = nb - i;
+            int cs = 0;
+            if (depth != 1)
+                vrotb(depth);
+            if ((vtop->r & VT_LVAL) || (vtop->r & VT_VALMASK) >= VT_CONST)
+                gv(RC_INT);
+            if (vtop->filc_kind == FILC_KIND_SLOT && vtop->filc_slot)
+                cs = vtop->filc_slot;
+            if (depth != 1)
+                vrott(depth);
+            if (ncap >= 32)
+                tcc_error("filc: too many pointer arguments");
+            cap_slot[ncap++] = cs;
+        }
+    }
+    vpush_helper_func(TOK_filc_call_push);
+    gfunc_call(0);
+    for (pi = 0; pi < ncap; pi++) {
+        vpushi(pi);
+        if (cap_slot[pi])
+            filc_push_saved(cap_slot[pi], FILC_KIND_SLOT);
+        else
+            filc_push_saved(0, FILC_KIND_NONE);
+        vpush_helper_func(TOK_filc_call_set);
+        vrott(3);
+        gfunc_call(2);
+    }
+}
+
+static void filc_prepare_call(int *pnb, int ret_bt, int sret_cap)
+{
+    int nb = *pnb;
+    SValue *fn;
+    const char *name = NULL;
+    int direct, ret_ptr;
+    filc_ret_mode = FILC_RET_NONE;
+    filc_ret_slot = 0;
+    filc_frame_pushed = 0;
+    filc_n_arg_temps = 0;
+    if (!filc_on())
+        return;
+    fn = vtop - nb;
+    ret_ptr = ((ret_bt & VT_BTYPE) == VT_PTR || (ret_bt & VT_BTYPE) == VT_FUNC);
+    direct = (fn->r & VT_SYM) && fn->sym && !(fn->r & VT_LVAL);
+    if (direct)
+        name = get_tok_str(fn->sym->v, NULL);
+    if (direct && name && filc_try_setjmp(name, nb))
+        return;
+    if (direct && name && filc_try_longjmp(fn, name, nb))
+        return;
+    if (direct && name && filc_try_alloca(name, nb))
+        return;
+    if (direct && filc_is_yolo(name)) {
+        if (ret_ptr)
+            filc_ret_mode = FILC_RET_NULL;
+        return;
+    }
+    if (direct && filc_intercept(name, pnb, ret_ptr))
+        return;
+    if (!direct)
+        filc_check_indirect(nb);
+    filc_pass_arg_caps(nb, sret_cap);
+    if (!direct)
+        filc_adapt_indirect(nb);
+    if (ret_ptr)
+        filc_ret_mode = FILC_RET_GET;
+    filc_frame_pushed = 1;
+}
+
+static int filc_ret_keepable(int t)
+{
+    switch (t & VT_BTYPE) {
+    case VT_INT:
+    case VT_LLONG:
+    case VT_PTR:
+    case VT_FUNC:
+    case VT_FLOAT:
+    case VT_DOUBLE:
+    case VT_LDOUBLE:
+    case VT_BYTE:
+    case VT_SHORT:
+    case VT_BOOL:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void filc_after_call(int ret_reg, int ret_type)
+{
+    int ival = 0, ival2 = 0;
+    int keep, two, r2, half, need_call, i;
+    int alloca_sz;
+    if (!tcc_state->filc)
+        return;
+    /* Read before any helper call. Covering the block reenters nothing
+     * named alloca, but a stale slot would cover the wrong size. */
+    alloca_sz = filc_alloca_size_slot;
+    if (alloca_sz)
+        filc_alloca_size_slot = 0;
+    two = (ret_type & VT_BTYPE) == VT_QLONG || (ret_type & VT_BTYPE) == VT_QFLOAT;
+    keep = !two && ret_reg >= 0;
+    r2 = VT_CONST;
+    half = VT_LLONG;
+    if (two) {
+        half = ((ret_type & VT_BTYPE) == VT_QFLOAT) ? VT_DOUBLE : VT_LLONG;
+        ret_reg = R_RET(ret_type);
+        r2 = R2_RET(ret_type);
+    }
+    if (filc_ret_mode == FILC_RET_PTR && keep) {
+        filc_ret_slot = filc_raw_slot();
+        filc_store_reg(ret_reg, ret_type, filc_ret_slot);
+        filc_load_reg(ret_reg, ret_type, filc_ret_slot);
+    }
+    need_call = filc_frame_pushed || filc_ret_mode == FILC_RET_GET
+        || filc_n_arg_temps || alloca_sz;
+    if (!need_call)
+        return;
+    if (keep) {
+        ival = filc_slot_for(ret_type);
+        filc_store_reg(ret_reg, ret_type, ival);
+    } else if (two) {
+        ival = filc_slot_for(half);
+        filc_store_reg(ret_reg, half, ival);
+        if (r2 != VT_CONST) {
+            ival2 = filc_slot_for(half);
+            filc_store_reg(r2, half, ival2);
+        }
+    }
+    if (filc_frame_pushed) {
+        vpush_helper_func(TOK_filc_call_pop);
+        gfunc_call(0);
+        filc_frame_pushed = 0;
+    }
+    if (filc_ret_mode == FILC_RET_GET) {
+        vpush_helper_func(TOK_filc_get_ret);
+        gfunc_call(0);
+        filc_ret_slot = filc_raw_slot();
+        filc_store_reg(REG_IRET, VT_PTR, filc_ret_slot);
+    }
+    for (i = 0; i < filc_n_arg_temps; i++) {
+        filc_push_saved(filc_arg_temps[i], FILC_KIND_SLOT);
+        vpush_helper_func(TOK_filc_uncover);
+        vrott(2);
+        gfunc_call(1);
+    }
+    filc_n_arg_temps = 0;
+    if (keep)
+        filc_load_reg(ret_reg, ret_type, ival);
+    else if (two) {
+        filc_load_reg(ret_reg, half, ival);
+        if (r2 != VT_CONST)
+            filc_load_reg(r2, half, ival2);
+    }
+    /* alloca returns the new block in a register. Cover it for the rest
+     * of this function. lower == payload == the returned pointer.
+     * Do this after the generic RET_PTR spill so that path cannot replace
+     * the lower with the raw, unregistered bits. */
+    if (alloca_sz && ret_reg >= 0 && !two) {
+        int pslot;
+        CType ty;
+        pslot = filc_raw_slot();
+        filc_store_reg(ret_reg, VT_PTR, pslot);
+        ty.t = VT_PTR;
+        ty.ref = NULL;
+        vset(&ty, VT_LOCAL | VT_LVAL, pslot);
+        vset(&ty, VT_LOCAL | VT_LVAL, alloca_sz);
+        vpushi(0);
+        vpush_helper_func(TOK_filc_cover);
+        vrott(4);
+        gfunc_call(3);
+        filc_ret_slot = filc_raw_slot();
+        filc_store_reg(REG_IRET, VT_PTR, filc_ret_slot);
+        filc_push_saved(filc_ret_slot, FILC_KIND_SLOT);
+        vpush_helper_func(TOK_filc_track);
+        vrott(2);
+        gfunc_call(1);
+        filc_load_reg(ret_reg, VT_PTR, pslot);
+        filc_ret_mode = FILC_RET_PTR;
+    }
+}
+
+static void filc_clear_struct_ret(void)
+{
+    if (!filc_on())
+        return;
+    vpushi(0);
+    vpush_helper_func(TOK_filc_set_ret_n);
+    vrott(2);
+    gfunc_call(1);
+}
+
+/* Publish the pointer slots of the struct in vtop. The bytes are still
+ * loaded into the return registers afterwards. */
+static void filc_export_struct_ret(CType *st)
+{
+    int slots[8];
+    int n, i;
+    (void)st;
+    if (!filc_on())
+        return;
+    n = filc_snap_struct_caps(slots, 8);
+    vpushi(n);
+    vpush_helper_func(TOK_filc_set_ret_n);
+    vrott(2);
+    gfunc_call(1);
+    for (i = 0; i < n; i++) {
+        vpushi(i);
+        if (slots[i])
+            filc_push_saved(slots[i], FILC_KIND_SLOT);
+        else
+            filc_push_saved(0, FILC_KIND_NONE);
+        vpush_helper_func(TOK_filc_set_ret_at);
+        vrott(3);
+        gfunc_call(2);
+    }
+}
+
+/* Cover the local that holds a register struct return and install the
+ * pointer slots the callee published. */
+static void filc_import_struct_ret(int addr, CType *st)
+{
+    int offs[8];
+    int n = 0, i, size, align, slot;
+    if (!filc_on())
+        return;
+    size = type_size(st, &align);
+    if (size < 0)
+        size = 0;
+    slot = filc_cover_stack_addr(addr, size, 0);
+    filc_collect_ptr_offs(st, 0, offs, &n, 8);
+    for (i = 0; i < n; i++) {
+        int tmp;
+        vpushi(i);
+        vpush_helper_func(TOK_filc_get_ret_at);
+        vrott(2);
+        gfunc_call(1);
+        tmp = filc_raw_slot();
+        filc_store_reg(REG_IRET, VT_PTR, tmp);
+        filc_emit_store_cap_direct(slot, addr + offs[i], FILC_KIND_SLOT, tmp);
+    }
+    vtop->filc_kind = FILC_KIND_SLOT;
+    vtop->filc_slot = slot;
+    vtop->filc_chk = (vtop->r & VT_LVAL) ? 1 : 0;
+}
+
+static void filc_note_return_value(void)
+{
+    int bt;
+    if (!tcc_state->filc)
+        return;
+    bt = vtop->type.t & VT_BTYPE;
+    if (bt != VT_PTR && bt != VT_FUNC) {
+        vtop->filc_kind = 0;
+        vtop->filc_slot = 0;
+        vtop->filc_chk = 0;
+        filc_ret_mode = 0;
+        return;
+    }
+    if ((filc_ret_mode == FILC_RET_GET || filc_ret_mode == FILC_RET_PTR)
+        && filc_ret_slot) {
+        vtop->filc_kind = FILC_KIND_SLOT;
+        vtop->filc_slot = filc_ret_slot;
+        vtop->filc_chk = 0;
+    } else {
+        vtop->filc_kind = FILC_KIND_NULL;
+        vtop->filc_slot = 0;
+        vtop->filc_chk = 0;
+    }
+    filc_ret_mode = 0;
+}
+
 
 /* Merge symbol attributes.  */
 static void merge_symattr(struct SymAttr *sa, struct SymAttr *sa1)
@@ -1591,6 +3959,10 @@ ST_FUNC void gaddrof(void)
     /* tricky: if saved lvalue, then we can go back to lvalue */
     if ((vtop->r & VT_VALMASK) == VT_LLOCAL)
         vtop->r = (vtop->r & ~VT_VALMASK) | VT_LOCAL | VT_LVAL;
+    /* &obj keeps that object's lower. The result is an address, not a
+     * checked lvalue. Function decay covers separately, before mk_pointer. */
+    if (tcc_state->filc && vtop->filc_chk)
+        vtop->filc_chk = 0;
 }
 
 #ifdef CONFIG_TCC_BCHECK
@@ -1848,6 +4220,7 @@ ST_FUNC int gv(int rc)
 {
     int r, r2, r_ok, r2_ok, rc2, bt;
     int bit_pos, bit_size, size, align;
+    int filc_fix = 0, filc_k = 0, filc_s = 0;
 
     /* NOTE: get_reg can modify vstack[] */
     if (vtop->type.t & VT_BITFIELD) {
@@ -1857,6 +4230,13 @@ ST_FUNC int gv(int rc)
         bit_size = BIT_SIZE(vtop->type.t);
         /* remove bit field info to avoid loops */
         vtop->type.t &= ~VT_STRUCT_MASK;
+
+        if (filc_on() && (vtop->r & VT_LVAL) && vtop->filc_chk) {
+            filc_emit_check(0);
+            vtop->filc_chk = 0;
+            vtop->filc_kind = 0;
+            vtop->filc_slot = 0;
+        }
 
         type.ref = NULL;
         type.t = vtop->type.t & VT_UNSIGNED;
@@ -1906,8 +4286,11 @@ ST_FUNC int gv(int rc)
 #endif
 
         bt = vtop->type.t & VT_BTYPE;
-        if (bt == VT_VOID || bt == VT_STRUCT) /* should not happen */
+        /* Structs are copied, not loaded. Leave their capability in place. */
+        if (bt == VT_VOID || bt == VT_STRUCT)
             return vtop->r;
+
+        filc_fix = filc_gv_prepare(&filc_k, &filc_s);
 
 #ifdef TCC_TARGET_RISCV64
         /* XXX mega hack */
@@ -1993,6 +4376,7 @@ ST_FUNC int gv(int rc)
         if (bt == VT_DOUBLE)
             vtop->r2 = r+1;
 #endif
+        filc_gv_finish(filc_fix, filc_k, filc_s);
     }
     return r;
 }
@@ -3066,11 +5450,15 @@ redo:
         
     if (bt1 == VT_FUNC || bt2 == VT_FUNC) {
 	if (bt2 == VT_FUNC) {
+            if (tcc_state->filc)
+                filc_cover_func();
 	    mk_pointer(&vtop->type);
 	    gaddrof();
 	}
 	if (bt1 == VT_FUNC) {
 	    vswap();
+            if (tcc_state->filc)
+                filc_cover_func();
 	    mk_pointer(&vtop->type);
 	    gaddrof();
 	    vswap();
@@ -3128,7 +5516,25 @@ op_err:
             } else
 #endif
             {
+                int filc_pk = 0, filc_ps = 0, filc_save = 0;
+                /* Load a pointer lvalue first so the saved lower is the
+                 * value's capability, not the slot that contains it.
+                 * gen_opi keeps that SValue for +/-, but other paths replace it. */
+                if (filc_on()) {
+                    vswap();
+                    if ((vtop->r & VT_LVAL) && vtop->filc_chk)
+                        gv(RC_INT);
+                    filc_pk = vtop->filc_kind;
+                    filc_ps = vtop->filc_slot;
+                    filc_save = 1;
+                    vswap();
+                }
                 gen_opic(op);
+                if (filc_save) {
+                    vtop->filc_kind = filc_pk;
+                    vtop->filc_slot = filc_ps;
+                    vtop->filc_chk = 0;
+                }
             }
             type1.t &= ~(VT_ARRAY|VT_VLA);
             /* put again type if gen_opic() swaped operands */
@@ -3178,6 +5584,17 @@ op_err:
             vtop->type.t = VT_INT;
         } else {
             vtop->type.t = t;
+        }
+    }
+    /* Drop a capability that belonged to a pointer operand once the
+     * result is an integer. A checked lvalue still has to be loaded. */
+    if (tcc_state->filc) {
+        int rbt = vtop->type.t & VT_BTYPE;
+        if (rbt != VT_PTR && rbt != VT_FUNC
+            && !((vtop->r & VT_LVAL) && vtop->filc_chk)) {
+            vtop->filc_kind = 0;
+            vtop->filc_slot = 0;
+            vtop->filc_chk = 0;
         }
     }
     // Make sure that we have converted to an rvalue:
@@ -3264,6 +5681,7 @@ static void gen_cast(CType *type)
 {
     int sbt, dbt, sf, df, c;
     int dbt_bt, sbt_bt, ds, ss, bits, trunc;
+    int was_func;
 
     /* special delayed cast for char/short */
     if (vtop->r & VT_MUSTCAST)
@@ -3278,6 +5696,7 @@ static void gen_cast(CType *type)
 
     dbt = type->t & (VT_BTYPE | VT_UNSIGNED);
     sbt = vtop->type.t & (VT_BTYPE | VT_UNSIGNED);
+    was_func = (sbt == VT_FUNC);
     if (sbt == VT_FUNC)
         sbt = VT_PTR;
 
@@ -3496,6 +5915,8 @@ error:
 done:
     vtop->type = *type;
     vtop->type.t &= ~ ( VT_QUAL | VT_ARRAY | VT_TLS );
+    if (tcc_state->filc)
+        filc_after_cast(sbt, was_func);
 }
 
 /* return type size as known at compile time. Put alignment at 'a' */
@@ -3717,16 +6138,30 @@ static void gen_assign_cast(CType *dt)
 ST_FUNC void vstore(void)
 {
     int sbt, dbt, ft, r, size, align, bit_size, bit_pos, delayed_cast;
+    int filc_ptr_store = 0;
 
     ft = vtop[-1].type.t;
     sbt = vtop->type.t & VT_BTYPE;
     dbt = ft & VT_BTYPE;
     verify_assign_cast(&vtop[-1].type);
 
+    if (filc_on() && (vtop[-1].r & VT_LVAL) && vtop[-1].filc_chk) {
+        int dbt0 = vtop[-1].type.t & VT_BTYPE;
+        filc_ptr_store = dbt0 == VT_PTR && !(vtop[-1].type.t & (VT_ARRAY | VT_BITFIELD));
+        vswap();
+        filc_emit_check(1);
+        vtop->filc_chk = 0;
+        vswap();
+    }
+
     if (sbt == VT_STRUCT) {
         /* if structure, only generate pointer */
         /* structure assignment : generate memcpy */
         size = type_size(&vtop->type, &align);
+        if (filc_on()) {
+            /* Copy payload and interior pointer capabilities together. */
+            filc_struct_assign(size);
+        } else {
         /* destination, keep on stack() as result */
         vpushv(vtop - 1);
 #ifdef CONFIG_TCC_BCHECK
@@ -3767,6 +6202,7 @@ ST_FUNC void vstore(void)
             vpush_helper_func(TOK_memmove);
             vrott(4);
             gfunc_call(3);
+        }
         }
 
     } else if (ft & VT_BITFIELD) {
@@ -3853,6 +6289,12 @@ ST_FUNC void vstore(void)
                 vtop->type.t = ft & VT_TYPE;
             }
 
+            /* Pointer store updates the integer and the capability together.
+             * Integer store leaves aux alone. */
+            if (filc_ptr_store) {
+                filc_emit_store_ptr();
+            } else {
+
             /* if lvalue was saved on stack, must read it */
             if ((vtop[-1].r & VT_VALMASK) == VT_LLOCAL) {
                 SValue sv;
@@ -3880,6 +6322,7 @@ ST_FUNC void vstore(void)
             } else {
                 /* single word */
                 store(r, vtop - 1);
+            }
             }
         vswap();
         vtop--; /* NOT vpop() because on x86 it would flush the fp stack */
@@ -5384,6 +7827,9 @@ ST_FUNC void indir(void)
     if (!(vtop->type.t & (VT_ARRAY | VT_VLA))
         && (vtop->type.t & VT_BTYPE) != VT_FUNC) {
         vtop->r |= VT_LVAL;
+        /* Even a null lower is checked, so a missing cap panics. */
+        if (tcc_state->filc)
+            vtop->filc_chk = 1;
         /* if bound checking, the referenced pointer must be checked */
 #ifdef CONFIG_TCC_BCHECK
         if (tcc_state->do_bounds_check)
@@ -5508,9 +7954,100 @@ static void parse_builtin_params(int nc, const char *args)
         nocode_wanted--;
 }
 
+/* Spill vtop's pointer bits and capability, then pop it. */
+static void filc_spill_ptr_top(int *kind, int *cap, int *bits)
+{
+    if ((vtop->r & VT_LVAL) || (vtop->r & VT_VALMASK) >= VT_CONST)
+        gv(RC_INT);
+    *kind = vtop->filc_kind;
+    *cap = vtop->filc_slot;
+    *bits = filc_slot_for(VT_PTR);
+    filc_store_reg(vtop->r & VT_VALMASK, VT_PTR, *bits);
+    vpop();
+}
+
+static void filc_push_spilled_ptr(int slot)
+{
+    CType ty;
+    ty.t = VT_PTR;
+    ty.ref = NULL;
+    vset(&ty, VT_LOCAL | VT_LVAL, slot);
+}
+
+/* Pointer atomics take the runtime lock so the integer and the capability
+ * move together. Leaves a pointer result in REG_IRET and *cap_out set,
+ * or an int result for compare_exchange (*cap_out stays 0). Store leaves
+ * the vstack empty. */
+static void filc_emit_ptr_atomic(int atok, int *cap_out)
+{
+    int k, s, bits, sk, ss, dbits, ek, es, ebits, vs, cs;
+    *cap_out = 0;
+    if (atok == TOK___atomic_store) {
+        /* The atomic argument is the address of the slot, not an lvalue
+         * of that slot. Load it the same way as the other atomics. */
+        vpop();
+        filc_spill_ptr_top(&sk, &ss, &dbits);
+        filc_spill_ptr_top(&k, &s, &bits);
+        filc_push_saved(s, k);
+        filc_push_spilled_ptr(bits);
+        filc_push_saved(ss, sk);
+        filc_push_spilled_ptr(dbits);
+        vpush_helper_func(TOK_filc_store_ptr);
+        vrott(5);
+        gfunc_call(4);
+        return;
+    }
+    if (atok == TOK___atomic_load) {
+        vpop();
+        filc_spill_ptr_top(&k, &s, &bits);
+        filc_push_saved(s, k);
+        filc_push_spilled_ptr(bits);
+        vpush_helper_func(TOK_filc_atomic_load);
+        vrott(3);
+        gfunc_call(2);
+    } else if (atok == TOK___atomic_exchange) {
+        vpop();
+        filc_spill_ptr_top(&sk, &ss, &dbits);
+        filc_spill_ptr_top(&k, &s, &bits);
+        filc_push_saved(s, k);
+        filc_push_spilled_ptr(bits);
+        filc_push_saved(ss, sk);
+        filc_push_spilled_ptr(dbits);
+        vpush_helper_func(TOK_filc_atomic_xchg);
+        vrott(5);
+        gfunc_call(4);
+    } else {
+        vpop();
+        vpop();
+        vpop();
+        filc_spill_ptr_top(&sk, &ss, &dbits);
+        filc_spill_ptr_top(&ek, &es, &ebits);
+        filc_spill_ptr_top(&k, &s, &bits);
+        filc_push_saved(s, k);
+        filc_push_spilled_ptr(bits);
+        filc_push_saved(es, ek);
+        filc_push_spilled_ptr(ebits);
+        filc_push_saved(ss, sk);
+        filc_push_spilled_ptr(dbits);
+        vpush_helper_func(TOK_filc_atomic_cmpxchg);
+        vrott(7);
+        gfunc_call(6);
+        return;
+    }
+    vs = filc_slot_for(VT_PTR);
+    filc_store_reg(REG_IRET, VT_PTR, vs);
+    vpush_helper_func(TOK_filc_get_ret);
+    gfunc_call(0);
+    cs = filc_raw_slot();
+    filc_store_reg(REG_IRET, VT_PTR, cs);
+    filc_load_reg(REG_IRET, VT_PTR, vs);
+    *cap_out = cs;
+}
+
 static void parse_atomic(int atok)
 {
     int size, align, arg, t, save = 0;
+    int filc_cap_slot = 0;
     CType *atom, *atom_ptr, ct = {0};
     SValue store;
     char buf[40];
@@ -5618,10 +8155,19 @@ static void parse_atomic(int atok)
         break;
     }
 
-    sprintf(buf, "%s_%d", get_tok_str(atok, 0), size);
-    vpush_helper_func(tok_alloc_const(buf));
-    vrott(arg - save + 1);
-    gfunc_call(arg - save);
+    /* Pointer-sized pointer slots update aux under the filc lock.
+     * Integer atomics stay on the CPU helpers. */
+    if (filc_on() && atom && size == PTR_SIZE
+        && ((atom->t & VT_BTYPE) == VT_PTR || (atom->t & VT_BTYPE) == VT_FUNC)
+        && !(atom->t & VT_ARRAY)
+        && atok <= TOK___atomic_compare_exchange) {
+        filc_emit_ptr_atomic(atok, &filc_cap_slot);
+    } else {
+        sprintf(buf, "%s_%d", get_tok_str(atok, 0), size);
+        vpush_helper_func(tok_alloc_const(buf));
+        vrott(arg - save + 1);
+        gfunc_call(arg - save);
+    }
 
     vpush(&ct);
     PUT_R_RET(vtop, ct.t);
@@ -5634,6 +8180,11 @@ static void parse_atomic(int atok)
 #endif
     }
     gen_cast(&ct);
+    if (filc_cap_slot) {
+        vtop->filc_kind = FILC_KIND_SLOT;
+        vtop->filc_slot = filc_cap_slot;
+        vtop->filc_chk = 0;
+    }
     if (save) {
         vpush(&ct);
         *vtop = store;
@@ -5808,6 +8359,8 @@ ST_FUNC void unary(void)
             test_lvalue();
         if (vtop->sym)
           vtop->sym->a.addrtaken = 1;
+        if (tcc_state->filc && (vtop->type.t & VT_BTYPE) == VT_FUNC)
+            filc_cover_func();
         mk_pointer(&vtop->type);
         gaddrof();
         break;
@@ -5984,6 +8537,65 @@ ST_FUNC void unary(void)
 	vswap();
 	vpop();
 	break;
+    case TOK_builtin_filc_va_arg: {
+        /* ap, type -> lvalue of the va slot. __va_arg only moves the
+         * cursor. A fresh slot (reg save or overflow interior) is covered
+         * and, when it holds pointers, filled from the frame's cap cursor.
+         * A memory struct already has aux; do not consume caps for it. */
+        CType type, ty;
+        int cls, sz, al, addr, jmp, tmp, i;
+        int offs[8], nptr;
+        int va_tok;
+        parse_builtin_params(0, "et");
+        type = vtop->type;
+        vpop();
+        sz = type_size(&type, &al);
+        if (sz < 0)
+            sz = 0;
+        cls = classify_x86_64_va_arg(&type);
+        va_tok = tok_alloc("__va_arg", 8)->tok;
+        vpushi(cls);
+        vpushi(sz);
+        vpushi(al);
+        vpush_helper_func(va_tok);
+        vrott(5);
+        gfunc_call(4);
+        addr = filc_raw_slot();
+        filc_store_reg(REG_IRET, VT_PTR, addr);
+        ty.t = VT_PTR;
+        ty.ref = NULL;
+        vset(&ty, VT_LOCAL | VT_LVAL, addr);
+        vpushi(sz);
+        vpush_helper_func(TOK_filc_va_prepare);
+        vrott(3);
+        gfunc_call(2);
+        vset(&int_type, REG_IRET, 0);
+        jmp = gvtst(1, 0);
+        nptr = 0;
+        filc_collect_ptr_offs(&type, 0, offs, &nptr, 8);
+        for (i = 0; i < nptr; i++) {
+            tmp = filc_raw_slot();
+            vpush_helper_func(TOK_filc_va_take);
+            gfunc_call(0);
+            filc_store_reg(REG_IRET, VT_PTR, tmp);
+            vset(&ty, VT_LOCAL | VT_LVAL, addr);
+            vset(&char_pointer_type, VT_LOCAL | VT_LVAL, addr);
+            if (offs[i]) {
+                vpushi(offs[i]);
+                gen_op('+');
+            }
+            filc_push_saved(tmp, FILC_KIND_SLOT);
+            vpush_helper_func(TOK_filc_store_cap);
+            vrott(4);
+            gfunc_call(3);
+        }
+        gsym(jmp);
+        vset(&type, VT_LLOCAL | VT_LVAL, addr);
+        vtop->filc_kind = FILC_KIND_SLOT;
+        vtop->filc_slot = addr;
+        vtop->filc_chk = 1;
+        break;
+    }
 #endif
 #endif
 
@@ -6200,6 +8812,8 @@ special_math_val:
 	vtop->sym = s;
 
         if (r & VT_SYM) {
+            /* s->c is the ELF symbol index, not an address addend.
+             * Clear it before any -filc cover uses this value. */
             vtop->c.i = 0;
 #ifdef TCC_TARGET_PE
             if (s->a.dllimport) {
@@ -6211,6 +8825,8 @@ special_math_val:
         } else if (r == VT_CONST && IS_ENUM_VAL(s->type.t)) {
             vtop->c.i = s->enum_val;
         }
+        if (tcc_state->filc)
+            filc_bind_sym(s);
         break;
     }
     
@@ -6241,6 +8857,8 @@ special_math_val:
             /* an array is never an lvalue */
             if (!(vtop->type.t & VT_ARRAY)) {
                 vtop->r |= VT_LVAL;
+                if (tcc_state->filc)
+                    vtop->filc_chk = 1;
 #ifdef CONFIG_TCC_BCHECK
                 /* if bound checking, the referenced pointer must be checked */
                 if (tcc_state->do_bounds_check)
@@ -6258,12 +8876,17 @@ special_math_val:
             SValue ret;
             Sym *sa;
             int nb_args, ret_nregs, ret_align, regsize, variadic;
+            int filc_hidden_cap = 0;
             TokenString *p, *p2;
 
             /* function call  */
             if ((vtop->type.t & VT_BTYPE) != VT_FUNC) {
                 /* pointer test (no array accepted) */
                 if ((vtop->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR) {
+                    /* Load while the value is still a pointer. Retyping it
+                     * to a function first makes -filc drop the capability. */
+                    if (tcc_state->filc && (vtop->r & VT_LVAL))
+                        gv(RC_INT);
                     vtop->type = *pointed_type(&vtop->type);
                     if ((vtop->type.t & VT_BTYPE) != VT_FUNC)
                         goto error_func;
@@ -6310,8 +8933,13 @@ special_math_val:
                     ret.c = vtop->c;
                     if (ret_nregs < 0)
                       vtop--;
-                    else
+                    else {
                       nb_args++;
+                      /* The hidden temp is the return object. Its lower is
+                       * capability index 0; the callee writes aux into it. */
+                      if (filc_on())
+                          filc_hidden_cap = filc_cover_stack_addr(ret.c.i, size, 0);
+                    }
                 }
             } else {
                 ret_nregs = 1;
@@ -6363,7 +8991,25 @@ special_math_val:
 
             next();
             vcheck_cmp(); /* the generators don't like VT_CMP on vtop */
+            if (tcc_state->filc) {
+                filc_prepare_call(&nb_args, ret.type.t, filc_hidden_cap);
+                if (filc_on() && ret_nregs > 0
+                    && (s->type.t & VT_BTYPE) == VT_STRUCT)
+                    filc_clear_struct_ret();
+            }
             gfunc_call(nb_args);
+            if (tcc_state->filc) {
+                int bt = ret.type.t & VT_BTYPE;
+                int keep = ret_nregs == 1 && filc_ret_keepable(bt);
+                int spill_r = -1, spill_t = VT_INT;
+                /* VT_QLONG / VT_QFLOAT are the two-register struct returns.
+                 * load() cannot round-trip them; spill each half instead. */
+                if (keep || bt == VT_QLONG || bt == VT_QFLOAT) {
+                    spill_r = ret.r;
+                    spill_t = ret.type.t;
+                }
+                filc_after_call(spill_r, spill_t);
+            }
 
             if (ret_nregs < 0) {
                 vsetc(&ret.type, ret.r, &ret.c);
@@ -6386,6 +9032,8 @@ special_math_val:
                 }
                 vsetc(&ret.type, ret.r, &ret.c);
                 vtop->r2 = ret.r2;
+                if (ret_nregs == 1)
+                    filc_note_return_value();
 
                 /* handle packed struct return */
                 if (((s->type.t & VT_BTYPE) == VT_STRUCT) && ret_nregs) {
@@ -6410,6 +9058,12 @@ special_math_val:
                         offset += regsize;
                     }
                     vset(&s->type, VT_LOCAL | VT_LVAL, addr);
+                    if (tcc_state->filc)
+                        filc_import_struct_ret(addr, &s->type);
+                } else if (filc_hidden_cap) {
+                    vtop->filc_kind = FILC_KIND_SLOT;
+                    vtop->filc_slot = filc_hidden_cap;
+                    vtop->filc_chk = (vtop->r & VT_LVAL) ? 1 : 0;
                 }
 
                 /* Promote char/short return values. This is matters only
@@ -6655,7 +9309,7 @@ static int is_cond_bool(SValue *sv)
 
 static void expr_cond(void)
 {
-    int tt, u, r1, r2, rc, t1, t2, islv, c, g;
+    int tt, u, r1, r2, rc, t1, t2, islv, c, g, filc_phi = 0;
     SValue sv;
     CType type;
 
@@ -6733,6 +9387,15 @@ static void expr_cond(void)
            that `(expr ? a : b).mem` does not error  with "lvalue expected" */
         islv = VT_STRUCT == (type.t & VT_BTYPE);
 
+        /* One slot, allocated with no code, so both branches can spill a lower. */
+        {
+            int bt = type.t & VT_BTYPE;
+            filc_phi = 0;
+            if (c < 0 && filc_on() && type.t != VT_VOID
+                && (bt == VT_PTR || bt == VT_FUNC || islv))
+                filc_phi = filc_raw_slot();
+        }
+
         /* now we convert second operand */
         if (c != 1) {
             gen_cast(&type);
@@ -6740,6 +9403,8 @@ static void expr_cond(void)
                 mk_pointer(&vtop->type);
                 gaddrof();
             }
+            if (filc_phi)
+                filc_spill_cap_here(filc_phi);
         }
 
         rc = RC_TYPE(type.t);
@@ -6767,6 +9432,8 @@ static void expr_cond(void)
                 mk_pointer(&vtop->type);
                 gaddrof();
             }
+            if (filc_phi)
+                filc_spill_cap_here(filc_phi);
         }
 
         if (c < 0) {
@@ -6778,6 +9445,11 @@ static void expr_cond(void)
             gsym(tt);
         }
 
+        if (filc_phi) {
+            vtop->filc_kind = FILC_KIND_SLOT;
+            vtop->filc_slot = filc_phi;
+            vtop->filc_chk = 0;
+        }
         if (islv)
           indir();
     }
@@ -6865,6 +9537,8 @@ static void gfunc_return(CType *func_type)
         int ret_align, ret_nregs, regsize;
         ret_nregs = gfunc_sret(func_type, func_var, &ret_type,
                                &ret_align, &regsize);
+        if (filc_on() && ret_nregs > 0)
+            filc_export_struct_ret(func_type);
         if (ret_nregs < 0) {
 #ifdef TCC_TARGET_RISCV64
             arch_transfer_ret_regs(0);
@@ -6876,6 +9550,12 @@ static void gfunc_return(CType *func_type)
             mk_pointer(&type);
             vset(&type, VT_LOCAL | VT_LVAL, func_vc);
             indir();
+            /* The caller's return object was covered and passed as cap 0. */
+            if (filc_on() && filc_sret_slot) {
+                vtop->filc_kind = FILC_KIND_SLOT;
+                vtop->filc_slot = filc_sret_slot;
+                vtop->filc_chk = 1;
+            }
             vswap();
             /* copy structure value to pointer */
             vstore();
@@ -6896,6 +9576,12 @@ static void gfunc_return(CType *func_type)
                 addr = loc;
                 type = *func_type;
                 vset(&type, VT_LOCAL | VT_LVAL, addr);
+                if (filc_on()) {
+                    int sl = filc_cover_stack_addr(addr, size, 0);
+                    vtop->filc_kind = FILC_KIND_SLOT;
+                    vtop->filc_slot = sl;
+                    vtop->filc_chk = 0;
+                }
                 vswap();
                 vstore();
                 vpop();
@@ -6919,6 +9605,11 @@ static void gfunc_return(CType *func_type)
         }
     } else {
         gv(RC_RET(func_type->t));
+        if (filc_on()) {
+            int bt = func_type->t & VT_BTYPE;
+            if (bt == VT_PTR || bt == VT_FUNC)
+                filc_set_return_cap();
+        }
     }
     vtop--; /* NOT vpop() because on x86 it would flush the fp stack */
 }
@@ -7116,8 +9807,10 @@ static void vla_leave(struct scope *o)
     for (; c != o && c; c = c->prev)
       if (c->vla.num)
         v = c;
-    if (v)
+    if (v) {
       vla_restore(v->vla.locorig);
+      filc_untrack_mark(v->filc_mark);
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -7130,6 +9823,7 @@ static void new_scope(struct scope *o)
     o->prev = cur_scope;
     cur_scope = o;
     cur_scope->vla.num = 0;
+    cur_scope->filc_mark = 0;
 
     /* record local declaration stack position */
     o->lstk = local_stack;
@@ -7215,6 +9909,8 @@ static void gexpr_decl(void)
         Sym *s = sym_find(v);
         vset(&s->type, s->r, (s->r & VT_SYM) ? 0 : s->c);
         vtop->sym = s;
+        if (tcc_state->filc)
+            filc_bind_sym(s);
     } else {
         if (v)
             skip(';');
@@ -7226,9 +9922,10 @@ static void block(int flags)
 {
     int a, b, c, d, e, t;
     struct scope o;
-    Sym *s;
+    Sym *s, *filc_lab;
 
 again:
+    filc_lab = NULL;
     t = tok;
     /* If the token carries a value, next() might destroy it. Only with
        invalid code such as f(){"123"4;} */
@@ -7319,6 +10016,23 @@ again:
         } else if (b) {
             tcc_warning("'return' with no value");
             b = 0;
+        }
+        /* A checked lvalue must be read before scope leave uncovers a
+         * VLA. Spill it: cleanups and the untrack call clobber registers.
+         * Default tcc still loads after leave_scope. */
+        if (b && filc_on() && (vtop->r & VT_LVAL)
+            && (func_vt.t & VT_BTYPE) != VT_STRUCT) {
+            int slot, reg;
+            gv(RC_RET(vtop->type.t));
+            reg = vtop->r & VT_VALMASK;
+            slot = filc_slot_for(vtop->type.t);
+            filc_store_reg(reg, vtop->type.t, slot);
+            if ((vtop->type.t & VT_BTYPE) == VT_LDOUBLE)
+                filc_drop_ld();
+            vtop->r = VT_LVAL | VT_LOCAL;
+            vtop->c.i = slot;
+            vtop->sym = NULL;
+            vtop->filc_chk = 0;
         }
         leave_scope(root_scope);
         if (b)
@@ -7501,6 +10215,10 @@ again:
 		s->jnext = gjmp(s->jnext);
 	    } else {
 		try_call_cleanup_goto(s->cleanupstate);
+                /* The label saved its track depth after fixing SP. Forward
+                 * gotos still have a zero slot and must not untrack. */
+                if (filc_on() && s->filc_slot)
+                    filc_untrack_mark(s->filc_slot);
 		gjmp_addr(s->jind);
 	    }
 	    next();
@@ -7511,6 +10229,10 @@ again:
         skip(';');
 
     } else if (t == TOK_ASM1 || t == TOK_ASM2 || t == TOK_ASM3) {
+        if (tcc_state->filc && !filc_asm_warned) {
+            filc_asm_warned = 1;
+            tcc_warning("inline asm is not checked by -filc");
+        }
         asm_instr();
 
     } else {
@@ -7534,6 +10256,7 @@ again:
             }
             s->jind = gind();
             s->cleanupstate = cur_scope->cl.s;
+            filc_lab = s;
 
     block_after_label:
             /* Accept attributes after labels (e.g. 'unused') */
@@ -7542,6 +10265,23 @@ again:
             if (debug_modes)
                 tcc_tcov_reset_ind(tcc_state);
             vla_restore(cur_scope->vla.loc);
+            /* SP is the live stack. Drop VLAs the restore abandoned.
+             * case/default share this path; `s` is not a label there. */
+            if (filc_on()) {
+                vpush_helper_func(TOK_filc_untrack_below);
+                gfunc_call(0);
+                if (filc_lab) {
+                    CType ty;
+                    if (!filc_lab->filc_slot)
+                        filc_lab->filc_slot = filc_raw_slot();
+                    ty.t = VT_PTR;
+                    ty.ref = NULL;
+                    vset(&ty, VT_LOCAL, filc_lab->filc_slot);
+                    vpush_helper_func(TOK_filc_label_set);
+                    vrott(2);
+                    gfunc_call(1);
+                }
+            }
 
             if (tok != '}') {
                 if (0 == (flags & STMT_COMPOUND))
@@ -7982,6 +10722,12 @@ static void init_putv(init_params *p, CType *type, unsigned long c)
 				  );
 		}
 	    }
+            /* Pointer capabilities live beside those relocs. Copy them
+             * onto the destination object; the literal keeps its own. */
+            if (tcc_state->filc)
+                filc_copy_init_recs(p, vtop->sym,
+                    vtop->c.i < 0 ? 0 : (unsigned long)vtop->c.i,
+                    (unsigned long)size, c);
 	} else {
             if (type->t & VT_BITFIELD) {
                 int bit_pos, bit_size, bits, n;
@@ -8047,10 +10793,15 @@ static void init_putv(init_params *p, CType *type, unsigned long c)
                 //tcc_internal_error("unexpected type");
                 break;
 	    }
+            /* Integer relocs stay integers. Only a pointer slot gets a lower. */
+            if (bt == VT_PTR)
+                filc_note_ptr_init(p, c);
 	}
         vtop--;
     } else {
         vset(&dtype, VT_LOCAL|VT_LVAL, c);
+        if (tcc_state->filc)
+            filc_bind_local_lvalue((int)c);
         vswap();
         vstore();
         vpop();
@@ -8514,6 +11265,26 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
 #endif
     }
 
+    /* Stack objects are covered before their initializer so pointer
+     * stores inside it can find the lower. Read-only is applied only
+     * when there is no initializer; otherwise the initializer itself
+     * would trip the write check. A second cover freezes it afterwards. */
+    if (filc_on() && (r & VT_VALMASK) == VT_LOCAL && !(type->t & VT_VLA)) {
+        int flags = 0, fslot;
+        if (filc_obj_readonly(type) && !has_init)
+            flags = FILC_F_READONLY;
+        fslot = filc_cover_stack_addr(addr, size > 0 ? size : 0, flags);
+        if (sym)
+            sym->filc_slot = fslot;
+        else if (!v) {
+            Sym *as = sym_push(anon_sym++, type, r, addr);
+            as->filc_slot = fslot;
+            vtop->filc_kind = FILC_KIND_SLOT;
+            vtop->filc_slot = fslot;
+            vtop->filc_chk = (vtop->r & VT_LVAL) ? 1 : 0;
+        }
+    }
+
     if (type->t & VT_VLA) {
         int a;
 
@@ -8531,9 +11302,19 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
                 gen_vla_sp_save(loc -= PTR_SIZE);
                 cur_scope->vla.locorig = loc;
             }
+            /* Mark is the track depth before this scope's VLAs, so leaving
+             * the scope uncovers them even when the payload address is reused. */
+            if (filc_on()) {
+                cur_scope->filc_mark = filc_raw_slot();
+                vpush_helper_func(TOK_filc_track_mark);
+                gfunc_call(0);
+                filc_store_reg(REG_IRET, VT_PTR, cur_scope->filc_mark);
+            }
         }
 
         vpush_type_size(type, &a);
+        if (filc_on())
+            vdup();
         gen_vla_alloc(type, a);
 #if defined TCC_TARGET_PE && defined TCC_TARGET_X86_64
         /* on _WIN64, because of the function args scratch area, the
@@ -8541,15 +11322,48 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
         gen_vla_result(addr), addr = (loc -= PTR_SIZE);
 #endif
         gen_vla_sp_save(addr);
+        if (filc_on()) {
+            CType ty;
+            int slot;
+            /* vtop is the byte size kept by vdup. The payload address
+             * was just stored in the local slot `addr`. */
+            ty.t = VT_PTR;
+            ty.ref = NULL;
+            vset(&ty, VT_LOCAL | VT_LVAL, addr);
+            vswap();
+            gen_cast_s(VT_SIZE_T);
+            vpushi(0);
+            vpush_helper_func(TOK_filc_cover);
+            vrott(4);
+            gfunc_call(3);
+            slot = filc_raw_slot();
+            filc_store_reg(REG_IRET, VT_PTR, slot);
+            filc_push_saved(slot, FILC_KIND_SLOT);
+            vpush_helper_func(TOK_filc_track);
+            vrott(2);
+            gfunc_call(1);
+            if (sym)
+                sym->filc_slot = slot;
+        }
         cur_scope->vla.loc = addr;
         cur_scope->vla.num++;
     } else if (has_init) {
         p.sec = sec;
+        if (tcc_state->filc && sec && sym) {
+            p.filc_obj = sym;
+            p.filc_base = (unsigned long)addr;
+            p.filc_size = size > 0 ? (unsigned long)size : 0;
+            if (filc_sec_readonly(sec, type))
+                p.filc_flags = FILC_F_READONLY;
+        }
         decl_initializer(&p, type, addr, DIF_FIRST);
         /* patch flexible array member size back to -1, */
         /* for possible subsequent similar declarations */
         if (flexible_array)
             flexible_array->type.ref->c = -1;
+        if (filc_on() && (r & VT_VALMASK) == VT_LOCAL && !(type->t & VT_VLA)
+            && filc_obj_readonly(type))
+            filc_cover_stack_addr(addr, size > 0 ? size : 0, FILC_F_READONLY);
     }
 
  no_alloc:
@@ -8560,6 +11374,24 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
     }
 
     nocode_wanted = saved_nocode_wanted;
+    /* Publish the defining size of every static or global object so a
+     * pointer initializer in this or another file cannot freeze a
+     * smaller size. Pointer slots were recorded during the initializer. */
+    if (tcc_state->filc && v && sym && (r & VT_VALMASK) != VT_LOCAL
+        && (type->t & VT_BTYPE) != VT_FUNC && size > 0) {
+        unsigned flags = 0;
+        if (filc_sec_readonly(sec, type))
+            flags = FILC_F_READONLY;
+        filc_emit_obj(sym, (unsigned long)size, flags);
+    }
+    /* Anonymous globals (string literals, compound literals in static
+     * storage) stay on the value stack. Cover them on creation. */
+    if (!v && filc_on() && (r & VT_VALMASK) != VT_LOCAL) {
+        int flags = 0;
+        if (sec == rodata_section || filc_obj_readonly(type))
+            flags = FILC_F_READONLY;
+        filc_cover_pushed(flags, 0);
+    }
 }
 
 /* generate vla code saved in post_type() */
@@ -8671,11 +11503,16 @@ static void gen_function(Sym *sym)
     nb_temp_local_vars = 0;
 
     gfunc_prolog(sym);
+    filc_mark_slot = 0;
+    if (tcc_state->filc)
+        filc_func_enter(sym);
     tcc_debug_prolog_epilog(tcc_state, 0);
     func_vla_arg(sym);
     block(0);
     gsym(rsym);
     nocode_wanted = 0;
+    if (tcc_state->filc)
+        filc_func_leave();
     tcc_debug_end_scope(NULL, !func_var);
     tcc_debug_prolog_epilog(tcc_state, 1);
     gfunc_epilog();

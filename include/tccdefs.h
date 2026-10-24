@@ -200,10 +200,16 @@
     } __builtin_va_list[1];
 
     void *__va_arg(__builtin_va_list ap, int arg_type, int size, int align);
+    #ifdef __FILC__
+    void filc_va_start(__builtin_va_list ap);
+    #define __builtin_va_start(ap, last) filc_va_start(ap)
+    #define __builtin_va_arg(ap, t) __builtin_filc_va_arg(ap, t)
+    #else
     #define __builtin_va_start(ap, last) \
        (*(ap) = *(__builtin_va_list)((char*)__builtin_frame_address(0) - 24))
     #define __builtin_va_arg(ap, t)   \
        (*(t *)(__va_arg(ap, __builtin_va_arg_types(t), sizeof(t), __alignof__(t))))
+    #endif
     #define __builtin_va_copy(dest, src) (*(dest) = *(src))
 
 #else /* _WIN64 */

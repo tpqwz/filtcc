@@ -682,7 +682,11 @@ ST_FUNC void gfunc_call(int nb_args)
                     indir();
                     vtop->type = vtop[-1].type;
                     vswap();
+                    if (tcc_state->filc)
+                        filc_struct_arg_copy(1);
                     vstore();
+                    if (tcc_state->filc)
+                        filc_struct_arg_copy(0);
                     vpop();
                     size = align = 8;
                 }
@@ -700,7 +704,11 @@ ST_FUNC void gfunc_call(int nb_args)
                     indir();
                     vtop->type = vtop[-1].type;
                     vswap();
+                    if (tcc_state->filc)
+                        filc_struct_arg_copy(1);
                     vstore();
+                    if (tcc_state->filc)
+                        filc_struct_arg_copy(0);
                     vtop->r = vtop->r2 = VT_CONST; // this arg is done
                     ofs += size;
                 }

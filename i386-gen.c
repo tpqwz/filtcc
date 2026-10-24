@@ -574,7 +574,11 @@ ST_FUNC void gfunc_call(int nb_args)
             }
             vset(&vtop->type, r | VT_LVAL, 0);
             vswap();
+            if (tcc_state->filc)
+                filc_struct_arg_copy(1);
             vstore();
+            if (tcc_state->filc)
+                filc_struct_arg_copy(0);
             args_size += size;
         } else if (is_float(vtop->type.t)) {
             gv(RC_FLOAT); /* only one float register */

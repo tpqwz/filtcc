@@ -492,6 +492,12 @@ typedef struct SValue {
       struct { unsigned short cmp_op, cmp_r; }; /* VT_CMP operation */
       struct Sym *sym;  /* symbol, if (VT_SYM | VT_CONST), or if */
     };                  /* result of unary() for an identifier. */
+    /* -filc capability. kind 0 = none, 1 = null lower, 2 = stack slot.
+       chk means this lvalue's access must be checked. slot is a negative
+       frame offset holding the lower, or 0. Cleared by vsetc. */
+    unsigned char filc_kind;
+    unsigned char filc_chk;
+    int filc_slot;
 
 } SValue;
 
@@ -507,7 +513,8 @@ struct SymAttr {
     dllimport   : 1,
     addrtaken   : 1,
     nodebug     : 1,
-    xxxx        : 2; /* not used */
+    filc_reg    : 1, /* -filc: an init record registers this object */
+    xxxx        : 1; /* not used */
 };
 
 /* function attributes or temporary attributes for parsing */
@@ -558,6 +565,8 @@ typedef struct Sym {
         struct Sym *cleanup_sym; /* symbol from __attribute__((cleanup())) */
         struct Sym *cleanup_label; /* label in 'pending_gotos' chain */
     };
+    int filc_slot; /* -filc: frame slot of this object's lower, or 0.
+                      Only meaningful for symbols of the current function. */
 } Sym;
 
 /* section definition */
@@ -784,6 +793,9 @@ struct TCCState {
     /* compile with built-in memory and bounds checker */
     unsigned char do_bounds_check;
 #endif
+    /* optional Fil-C / InvisiCaps checks (-filc). Default compilation
+       is unchanged when this is clear. */
+    unsigned char filc;
     unsigned char test_coverage;  /* generate test coverage code */
 
     /* use GNU C extensions */
@@ -1631,6 +1643,9 @@ ST_FUNC void gsym(int t);
 ST_FUNC void load(int r, SValue *sv);
 ST_FUNC void store(int r, SValue *v);
 ST_FUNC int gfunc_sret(CType *vt, int variadic, CType *ret, int *align, int *regsize);
+/* -filc: x86_64 gfunc_call sets this around the stack copy of a struct
+ * argument. The copy's destination has no capability until tccgen covers it. */
+ST_FUNC void filc_struct_arg_copy(int on);
 ST_FUNC void gfunc_call(int nb_args);
 ST_FUNC void gfunc_prolog(Sym *func_sym);
 ST_FUNC void gfunc_epilog(void);

@@ -1219,7 +1219,11 @@ again:
             vswap();
 	    /* XXX: optimize. Save all register because memcpy can use them */
 	    o(0xED2D0A00|(0&1)<<22|(0>>1)<<12|16); /* vpush {s0-s15} */
+            if (tcc_state->filc)
+                filc_struct_arg_copy(1);
             vstore(); /* memcpy to current sp + potential padding */
+            if (tcc_state->filc)
+                filc_struct_arg_copy(0);
 	    o(0xECBD0A00|(0&1)<<22|(0>>1)<<12|16); /* vpop {s0-s15} */
 
             /* Homogeneous float aggregate are loaded to VFP registers

@@ -1576,6 +1576,7 @@ enum {
     TCC_OPTION_mfloat_abi,
     TCC_OPTION_m,
     TCC_OPTION_f,
+    TCC_OPTION_filc,
     TCC_OPTION_isystem,
     TCC_OPTION_iwithprefix,
     TCC_OPTION_include,
@@ -1663,6 +1664,8 @@ static const TCCOption tcc_options[] = {
     { "mfloat-abi", TCC_OPTION_mfloat_abi, TCC_OPTION_HAS_ARG },
 #endif
     { "m", TCC_OPTION_m, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP },
+    /* Before "f": the matcher is a prefix match, so -filc must not be -f ilc. */
+    { "filc", TCC_OPTION_filc, 0 },
     { "f", TCC_OPTION_f, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP },
     { "isystem", TCC_OPTION_isystem, TCC_OPTION_HAS_ARG },
     { "include", TCC_OPTION_include, TCC_OPTION_HAS_ARG },
@@ -1947,9 +1950,18 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
 #ifdef CONFIG_TCC_BCHECK
         case TCC_OPTION_b:
             s->do_bounds_check = 1;
+            if (s->filc)
+                return tcc_error_noabort("-filc and -b cannot be combined");
             goto enable_backtrace;
 #endif
 #endif
+        case TCC_OPTION_filc:
+            s->filc = 1;
+#ifdef CONFIG_TCC_BCHECK
+            if (s->do_bounds_check)
+                return tcc_error_noabort("-filc and -b cannot be combined");
+#endif
+            break;
         case TCC_OPTION_g:
             s->do_debug = 2;
             s->dwarf = CONFIG_DWARF_VERSION;

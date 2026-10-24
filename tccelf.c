@@ -1849,6 +1849,12 @@ ST_FUNC void tcc_add_runtime(TCCState *s1)
             lpthread = 1;
         }
 #endif
+        if (s1->filc) {
+            tcc_add_support(s1, "filc_rt.o");
+            /* dlsym looks up the real libc without defining those names. */
+            tcc_add_library(s1, "dl");
+            lpthread = 1;
+        }
 #ifdef CONFIG_TCC_BACKTRACE
         if (s1->do_backtrace) {
             if (s1->output_type & TCC_OUTPUT_EXE)

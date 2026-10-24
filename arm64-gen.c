@@ -1084,7 +1084,11 @@ ST_FUNC void gfunc_call(int nb_args)
             arm64_spoff(intr(r), a1[i]);
             vset(&vtop->type, r | VT_LVAL, 0);
             vswap();
+            if (tcc_state->filc)
+                filc_struct_arg_copy(1);
             vstore();
+            if (tcc_state->filc)
+                filc_struct_arg_copy(0);
             if (a[i] >= 32) {
                 // pointer on stack
                 r = get_reg(RC_INT);
@@ -1099,7 +1103,11 @@ ST_FUNC void gfunc_call(int nb_args)
                 arm64_spoff(intr(r), a[i] - 32);
                 vset(&vtop->type, r | VT_LVAL, 0);
                 vswap();
+                if (tcc_state->filc)
+                    filc_struct_arg_copy(1);
                 vstore();
+                if (tcc_state->filc)
+                    filc_struct_arg_copy(0);
             }
             else if (is_float(vtop->type.t)) {
                 gv(RC_FLOAT);

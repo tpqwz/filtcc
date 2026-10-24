@@ -783,10 +783,44 @@ static int gfunc_arg_size(CType *type) {
     return type_size(type, &align);
 }
 
+/* 1 if this argument is passed in registers. Updates the register counts
+ * the same way gfunc_call does, so -filc can tell a register struct from
+ * one that spilled to the stack. */
+ST_FUNC int gfunc_arg_inreg(CType *ty, int *ireg, int *sreg)
+{
+    int size = gfunc_arg_size(ty);
+    if (!using_regs(size))
+        return 0;
+    if (is_sse_float(ty->t)) {
+        if (*sreg + 1 <= 8) {
+            (*sreg)++;
+            return 1;
+        }
+        return 0;
+    }
+    if (*ireg + 1 <= REGN) {
+        (*ireg)++;
+        return 1;
+    }
+    return 0;
+}
+
 void gfunc_call(int nb_args)
 {
     int size, r, args_size, i, d, bt, struct_size;
     int arg;
+    /* -filc checks are calls and clobber every caller-saved register,
+     * including r10/r11 (and r8/r9) where this loop parks arguments.
+     * Hold each prepared register argument in a frame slot until every
+     * gv() has returned, then reload straight into rcx/rdx/r8/r9. */
+    int filc_park;
+    int filc_ireg_slot[REGN], filc_sse_slot[REGN];
+
+    filc_park = tcc_state->filc;
+    if (filc_park) {
+        for (i = 0; i < REGN; i++)
+            filc_ireg_slot[i] = filc_sse_slot[i] = 0;
+    }
 
 #ifdef CONFIG_TCC_BCHECK
     if (tcc_state->do_bounds_check)
@@ -824,7 +858,11 @@ void gfunc_call(int nb_args)
             /* generate memcpy call */
             vset(&sv->type, r | VT_LVAL, 0);
             vpushv(sv);
+            if (tcc_state->filc)
+                filc_struct_arg_copy(1);
             vstore();
+            if (tcc_state->filc)
+                filc_struct_arg_copy(0);
             --vtop;
         } else if (bt == VT_LDOUBLE) {
             gv(RC_ST0);
@@ -851,6 +889,13 @@ void gfunc_call(int nb_args)
                 d = get_reg(RC_INT);
                 gen_offs_sp(0x8d, d, struct_size);
                 gen_offs_sp(0x89, d, arg*8);
+            } else if (filc_park) {
+                /* lea of the stack copy. A later gv() clobbers r10/r11. */
+                d = get_reg(RC_INT);
+                gen_offs_sp(0x8d, d, struct_size);
+                loc = (loc - 8) & -8;
+                gen_modrm64(0x89, d, VT_LOCAL, NULL, loc);
+                filc_ireg_slot[arg] = loc;
             } else {
                 d = arg_prepare_reg(arg);
                 gen_offs_sp(0x8d, d, struct_size);
@@ -864,6 +909,12 @@ void gfunc_call(int nb_args)
                     gv(RC_XMM0);
                     /* movq %xmm0, j*8(%rsp) */
                     gen_offs_sp(0xd60f66, 0x100, arg*8);
+                } else if (filc_park) {
+                    gv(RC_FRET);
+                    loc = (loc - 8) & -8;
+                    /* movq %xmm0, slot(%rbp) */
+                    gen_modrm32(0xd60f66, REG_FRET, VT_LOCAL, NULL, loc);
+                    filc_sse_slot[arg] = loc;
                 } else {
                     /* Load directly to xmmN register */
                     gv(RC_XMM0 << arg);
@@ -883,6 +934,10 @@ void gfunc_call(int nb_args)
                 r = gv(RC_INT);
                 if (arg >= REGN) {
                     gen_offs_sp(0x89, r, arg*8);
+                } else if (filc_park) {
+                    loc = (loc - 8) & -8;
+                    gen_modrm64(0x89, r, VT_LOCAL, NULL, loc);
+                    filc_ireg_slot[arg] = loc;
                 } else {
                     d = arg_prepare_reg(arg);
                     orex(1,d,r,0x89); /* mov */
@@ -893,8 +948,21 @@ void gfunc_call(int nb_args)
         vtop--;
     }
 
+    if (filc_park) {
+        /* Plain moves: no further calls, so the arg registers stay put.
+         * Windows also wants the float bits in the matching GPR. */
+        for (i = 0; i < REGN && i < nb_args; i++) {
+            if (filc_sse_slot[i]) {
+                gen_modrm32(0x7e0ff3, TREG_XMM0 + i, VT_LOCAL, NULL, filc_sse_slot[i]);
+                o(0x66);
+                orex(1, arg_regs[i], 0, 0x7e0f);
+                o(0xc0 + i * 8 + REG_VALUE(arg_regs[i]));
+            } else if (filc_ireg_slot[i]) {
+                gen_modrm64(0x8b, arg_regs[i], VT_LOCAL, NULL, filc_ireg_slot[i]);
+            }
+        }
     /* Copy R10 and R11 into RCX and RDX, respectively */
-    if (nb_args > 0) {
+    } else if (nb_args > 0) {
         o(0xd1894c); /* mov %r10, %rcx */
         if (nb_args > 1) {
             o(0xda894c); /* mov %r11, %rdx */
@@ -1214,6 +1282,30 @@ static int arg_prepare_reg(int idx) {
       return idx >= 0 && idx < REGN ? arg_regs[idx] : 0;
 }
 
+/* 1 if this argument is passed in registers. Updates the register counts
+ * the same way gfunc_call does, so -filc can tell a register struct from
+ * one that spilled to the stack. */
+ST_FUNC int gfunc_arg_inreg(CType *ty, int *ireg, int *sreg)
+{
+    int reg_count, size, align;
+    X86_64_Mode mode = classify_x86_64_arg(ty, NULL, &size, &align, &reg_count);
+    if (mode == x86_64_mode_integer) {
+        if (*ireg + reg_count <= REGN) {
+            *ireg += reg_count;
+            return 1;
+        }
+        return 0;
+    }
+    if (mode == x86_64_mode_sse) {
+        if (*sreg + reg_count <= 8) {
+            *sreg += reg_count;
+            return 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
 /* Generate function call. The function address is pushed first, then
    all the parameters in call order. This functions pops all the
    parameters and the function address. */
@@ -1225,7 +1317,19 @@ void gfunc_call(int nb_args)
     int nb_reg_args = 0;
     int nb_sse_args = 0;
     int sse_reg, gen_reg;
+    /* -filc checks are calls and clobber every caller-saved register,
+     * including r10/r11 where this loop parks rdx/rcx. Hold each
+     * prepared argument in a frame slot until every gv() has returned. */
+    int filc_park;
+    int filc_ireg_slot[6], filc_sreg_slot[8];
     char *onstack = tcc_malloc((nb_args + 1) * sizeof (char));
+    filc_park = tcc_state->filc;
+    if (filc_park) {
+        for (k = 0; k < 6; k++)
+            filc_ireg_slot[k] = 0;
+        for (k = 0; k < 8; k++)
+            filc_sreg_slot[k] = 0;
+    }
 
 #ifdef CONFIG_TCC_BCHECK
     if (tcc_state->do_bounds_check)
@@ -1308,7 +1412,11 @@ void gfunc_call(int nb_args)
 		o(0xf0e48348); /* and $-16,%rsp */
 		orex(0,r,0,0x50 + REG_VALUE(r)); /* push r (last %rsp) */
 		o(0x08ec8348); /* sub $8,%rsp */
+		if (tcc_state->filc)
+		    filc_struct_arg_copy(1);
 		vstore();
+		if (tcc_state->filc)
+		    filc_struct_arg_copy(0);
 		o(0x08c48348); /* add $8,%rsp */
 		o(0x5c);       /* pop %rsp */
 		break;
@@ -1364,7 +1472,15 @@ void gfunc_call(int nb_args)
             if (reg_count == 2) {
                 sse_reg -= 2;
                 gv(RC_FRET); /* Use pair load into xmm0 & xmm1 */
-                if (sse_reg) { /* avoid redundant movaps %xmm0, %xmm0 */
+                if (filc_park) {
+                    loc = (loc - 8) & -8;
+                    /* movq %xmm0, slot(%rbp) */
+                    gen_modrm32(0xd60f66, REG_FRET, VT_LOCAL, NULL, loc);
+                    filc_sreg_slot[sse_reg] = loc;
+                    loc = (loc - 8) & -8;
+                    gen_modrm32(0xd60f66, REG_FRE2, VT_LOCAL, NULL, loc);
+                    filc_sreg_slot[sse_reg + 1] = loc;
+                } else if (sse_reg) { /* avoid redundant movaps %xmm0, %xmm0 */
                     /* movaps %xmm1, %xmmN */
                     o(0x280f);
                     o(0xc1 + ((sse_reg+1) << 3));
@@ -1375,8 +1491,15 @@ void gfunc_call(int nb_args)
             } else {
                 assert(reg_count == 1);
                 --sse_reg;
-                /* Load directly to register */
-                gv(RC_XMM0 << sse_reg);
+                if (filc_park) {
+                    gv(RC_FRET);
+                    loc = (loc - 8) & -8;
+                    gen_modrm32(0xd60f66, REG_FRET, VT_LOCAL, NULL, loc);
+                    filc_sreg_slot[sse_reg] = loc;
+                } else {
+                    /* Load directly to register */
+                    gv(RC_XMM0 << sse_reg);
+                }
             }
         } else if (mode == x86_64_mode_integer) {
             /* simple type */
@@ -1384,13 +1507,24 @@ void gfunc_call(int nb_args)
             int d;
             gen_reg -= reg_count;
             r = gv(RC_INT);
-            d = arg_prepare_reg(gen_reg);
-            orex(1,d,r,0x89); /* mov */
-            o(0xc0 + REG_VALUE(r) * 8 + REG_VALUE(d));
-            if (reg_count == 2) {
-                d = arg_prepare_reg(gen_reg+1);
-                orex(1,d,vtop->r2,0x89); /* mov */
-                o(0xc0 + REG_VALUE(vtop->r2) * 8 + REG_VALUE(d));
+            if (filc_park) {
+                loc = (loc - 8) & -8;
+                gen_modrm64(0x89, r, VT_LOCAL, NULL, loc); /* mov r, slot(%rbp) */
+                filc_ireg_slot[gen_reg] = loc;
+                if (reg_count == 2) {
+                    loc = (loc - 8) & -8;
+                    gen_modrm64(0x89, vtop->r2, VT_LOCAL, NULL, loc);
+                    filc_ireg_slot[gen_reg + 1] = loc;
+                }
+            } else {
+                d = arg_prepare_reg(gen_reg);
+                orex(1,d,r,0x89); /* mov */
+                o(0xc0 + REG_VALUE(r) * 8 + REG_VALUE(d));
+                if (reg_count == 2) {
+                    d = arg_prepare_reg(gen_reg+1);
+                    orex(1,d,vtop->r2,0x89); /* mov */
+                    o(0xc0 + REG_VALUE(vtop->r2) * 8 + REG_VALUE(d));
+                }
             }
         }
         vtop--;
@@ -1398,8 +1532,15 @@ void gfunc_call(int nb_args)
     assert(gen_reg == 0);
     assert(sse_reg == 0);
 
-    /* Copy R10 and R11 into RDX and RCX, respectively */
-    if (nb_reg_args > 2) {
+    if (filc_park) {
+        /* Plain moves: no further calls, so the arg registers stay put. */
+        for (i = 0; i < nb_reg_args; i++)
+            gen_modrm64(0x8b, arg_regs[i], VT_LOCAL, NULL, filc_ireg_slot[i]);
+        for (i = 0; i < nb_sse_args; i++)
+            /* movq slot(%rbp), %xmmN */
+            gen_modrm32(0x7e0ff3, TREG_XMM0 + i, VT_LOCAL, NULL, filc_sreg_slot[i]);
+    } else if (nb_reg_args > 2) {
+        /* Copy R10 and R11 into RDX and RCX, respectively */
         o(0xd2894c); /* mov %r10, %rdx */
         if (nb_reg_args > 3) {
             o(0xd9894c); /* mov %r11, %rcx */
