@@ -79,11 +79,28 @@ OBJ-extra = $(filter $(EXTRA_O),$(OBJ-$T))
 OBJ-libtcc1 = $(addprefix $(X),$(filter-out $(OBJ-extra),$(OBJ-$T)))
 
 ALL = $(addprefix $(TOP)/,$(X)libtcc1.a $(OBJ-extra))
+# Checked helpers for -filc links. Assembly stays in the plain objects.
+ifeq ($(X),)
+ALL += $(TOP)/libtcc1-filc.a
+# va_list.c stays uninstrumented. __va_arg walks a compiler-built
+# va_list whose interior pointers are not capabilities yet.
+FILC1_C = libtcc1.c stdatomic.c builtin.c dsohandle.c tcov.c
+FILC1_O = $(FILC1_C:.c=-filc.o)
+FILC1_ASM = va_list.o alloca.o atomic.o alloca-bt.o
+endif
 
 all: $(ALL)
 
 $(TOP)/$(X)libtcc1.a : $(OBJ-libtcc1) $(TCC)
 	$S$(XAR) rcs $@ $(OBJ-libtcc1)
+
+ifeq ($(X),)
+$(TOP)/libtcc1-filc.a : $(FILC1_O) $(FILC1_ASM) $(TCC)
+	$S$(XAR) rcs $@ $(FILC1_O) $(FILC1_ASM)
+
+%-filc.o : %.c $(TCC)
+	$S$(XCC) -filc -c $< -o $@ $(XFLAGS)
+endif
 
 $(X)%.o : %.c $(TCC)
 	$S$(XCC) -c $< -o $@ $(XFLAGS)
@@ -105,4 +122,4 @@ $(X)wincrt1w.o : wincrt1.c
 $(TCC) : ;
 
 clean :
-	rm -f *.o $(addprefix $(TOP)/,*libtcc1.a $(EXTRA_O))
+	rm -f *.o $(addprefix $(TOP)/,*libtcc1.a libtcc1-filc.a $(EXTRA_O))

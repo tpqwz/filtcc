@@ -2204,6 +2204,26 @@ static void filc_untrack_mark(int slot)
     filc_load_reg(REG_FRET, VT_DOUBLE, fval);
 }
 
+/* `slot` holds the track depth saved by filc_track_mark. VLA scope
+ * leave loads that depth and uncovers objects tracked after it. The
+ * label helper would no-op: this slot was never filc_label_set. */
+static void filc_untrack_depth(int slot)
+{
+    int ival, fval;
+    if (!filc_on() || !slot)
+        return;
+    ival = filc_raw_slot();
+    fval = filc_raw_slot();
+    filc_store_reg(REG_IRET, VT_PTR, ival);
+    filc_store_reg(REG_FRET, VT_DOUBLE, fval);
+    filc_push_saved(slot, FILC_KIND_SLOT);
+    vpush_helper_func(TOK_filc_untrack_to);
+    vrott(2);
+    gfunc_call(1);
+    filc_load_reg(REG_IRET, VT_PTR, ival);
+    filc_load_reg(REG_FRET, VT_DOUBLE, fval);
+}
+
 static void filc_func_leave(void)
 {
     int ival, fval;
@@ -2461,6 +2481,72 @@ static int filc_try_bytes(const char *name, int *pnb)
         filc_push_ival(1);
         filc_finish_intercept(TOK_filc_fstat, 3);
         *pnb = 3;
+        return 1;
+    }
+    return 0;
+}
+
+/* Number scans. The end pointer is an interior pointer into the source,
+ * so it keeps that object's capability instead of whatever the slot held. */
+static int filc_try_strto(const char *name, int *pnb)
+{
+    int nb = *pnb;
+    int tok = 0;
+    if (nb == 3) {
+        if (!strcmp(name, "strtol"))
+            tok = TOK_filc_strtol;
+        else if (!strcmp(name, "strtoll"))
+            tok = TOK_filc_strtoll;
+        else if (!strcmp(name, "strtoul"))
+            tok = TOK_filc_strtoul;
+        else if (!strcmp(name, "strtoull"))
+            tok = TOK_filc_strtoull;
+        if (!tok)
+            return 0;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(tok, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (nb == 2) {
+        if (!strcmp(name, "strtof"))
+            tok = TOK_filc_strtof;
+        else if (!strcmp(name, "strtod"))
+            tok = TOK_filc_strtod;
+        else if (!strcmp(name, "strtold"))
+            tok = TOK_filc_strtold;
+        if (!tok)
+            return 0;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(tok, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (nb == 1) {
+        if (!strcmp(name, "atoi"))
+            tok = TOK_filc_atoi;
+        else if (!strcmp(name, "atol"))
+            tok = TOK_filc_atol;
+        else if (!strcmp(name, "atoll"))
+            tok = TOK_filc_atoll;
+        else if (!strcmp(name, "atof"))
+            tok = TOK_filc_atof;
+        if (!tok)
+            return 0;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(tok, 2);
+        *pnb = 2;
         return 1;
     }
     return 0;
@@ -3057,6 +3143,8 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         return 1;
     }
     if (filc_try_bytes(name, pnb))
+        return 1;
+    if (filc_try_strto(name, pnb))
         return 1;
     if (filc_try_sort(name, pnb))
         return 1;
@@ -9809,7 +9897,7 @@ static void vla_leave(struct scope *o)
         v = c;
     if (v) {
       vla_restore(v->vla.locorig);
-      filc_untrack_mark(v->filc_mark);
+      filc_untrack_depth(v->filc_mark);
     }
 }
 

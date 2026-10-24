@@ -1880,7 +1880,9 @@ ST_FUNC void tcc_add_runtime(TCCState *s1)
         tcc_add_library(s1, "gcc_s"); // unwind code
 #endif
         if (TCC_LIBTCC1[0]) {
-            tcc_add_support(s1, TCC_LIBTCC1);
+            /* -filc programs link the checked helpers. The plain archive
+             * stays uninstrumented so ordinary programs still link. */
+            tcc_add_support(s1, s1->filc ? "libtcc1-filc.a" : TCC_LIBTCC1);
             tcc_add_library(s1, "c");
         }
 #ifndef TCC_TARGET_MACHO

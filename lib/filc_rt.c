@@ -36,7 +36,10 @@
  * capability. Nested qsort or bsearch stops at eight frames.
  * strcasecmp, strncasecmp, strcasestr, and memmem check their inputs.
  * A match keeps the haystack capability. stat, lstat, and fstat check
- * the path and the whole struct stat. Pointer
+ * the path and the whole struct stat. strtol, strtoll, strtoul,
+ * strtoull, strtof, strtod, and strtold require a terminator inside
+ * the source object. The end pointer keeps that object's capability.
+ * atoi, atol, atoll, and atof check the string the same way. Pointer
  * __atomic_load/store/exchange/compare_exchange
  * update the integer and the capability under the same lock; memory
  * order is ignored, and compare_exchange matches integer bits only.
@@ -3095,7 +3098,171 @@ static int ent_fstat(int fd, struct stat *buf)
     return filc_fstat(filc_call_get(0), fd, buf);
 }
 
-#define FILC_NENTS 80
+/* libc walks until it sees a terminator. Require that terminator to
+ * sit inside the source object, then publish the end pointer as an
+ * interior pointer of that same object. */
+static void filc_set_end(void *sl, char *e, void *el, char **end)
+{
+    if (!end)
+        return;
+    if (!e)
+        filc_panic("bad capability");
+    filc_check(sl, e, 1, 0);
+    filc_store_ptr(el, end, sl, (uintptr_t)e);
+}
+
+long filc_strtol(void *sl, const char *s, void *el, char **end, int base)
+{
+    char *e = NULL;
+    long v;
+    filc_strlen(sl, s);
+    v = strtol(s, end ? &e : NULL, base);
+    filc_set_end(sl, e, el, end);
+    return v;
+}
+
+long long filc_strtoll(void *sl, const char *s, void *el, char **end, int base)
+{
+    char *e = NULL;
+    long long v;
+    filc_strlen(sl, s);
+    v = strtoll(s, end ? &e : NULL, base);
+    filc_set_end(sl, e, el, end);
+    return v;
+}
+
+unsigned long filc_strtoul(void *sl, const char *s, void *el, char **end,
+    int base)
+{
+    char *e = NULL;
+    unsigned long v;
+    filc_strlen(sl, s);
+    v = strtoul(s, end ? &e : NULL, base);
+    filc_set_end(sl, e, el, end);
+    return v;
+}
+
+unsigned long long filc_strtoull(void *sl, const char *s, void *el, char **end,
+    int base)
+{
+    char *e = NULL;
+    unsigned long long v;
+    filc_strlen(sl, s);
+    v = strtoull(s, end ? &e : NULL, base);
+    filc_set_end(sl, e, el, end);
+    return v;
+}
+
+float filc_strtof(void *sl, const char *s, void *el, char **end)
+{
+    char *e = NULL;
+    float v;
+    filc_strlen(sl, s);
+    v = strtof(s, end ? &e : NULL);
+    filc_set_end(sl, e, el, end);
+    return v;
+}
+
+double filc_strtod(void *sl, const char *s, void *el, char **end)
+{
+    char *e = NULL;
+    double v;
+    filc_strlen(sl, s);
+    v = strtod(s, end ? &e : NULL);
+    filc_set_end(sl, e, el, end);
+    return v;
+}
+
+long double filc_strtold(void *sl, const char *s, void *el, char **end)
+{
+    char *e = NULL;
+    long double v;
+    filc_strlen(sl, s);
+    v = strtold(s, end ? &e : NULL);
+    filc_set_end(sl, e, el, end);
+    return v;
+}
+
+int filc_atoi(void *sl, const char *s)
+{
+    filc_strlen(sl, s);
+    return atoi(s);
+}
+
+long filc_atol(void *sl, const char *s)
+{
+    filc_strlen(sl, s);
+    return atol(s);
+}
+
+long long filc_atoll(void *sl, const char *s)
+{
+    filc_strlen(sl, s);
+    return atoll(s);
+}
+
+double filc_atof(void *sl, const char *s)
+{
+    filc_strlen(sl, s);
+    return atof(s);
+}
+
+static long ent_strtol(const char *s, char **end, int base)
+{
+    return filc_strtol(filc_call_get(0), s, filc_call_get(1), end, base);
+}
+
+static long long ent_strtoll(const char *s, char **end, int base)
+{
+    return filc_strtoll(filc_call_get(0), s, filc_call_get(1), end, base);
+}
+
+static unsigned long ent_strtoul(const char *s, char **end, int base)
+{
+    return filc_strtoul(filc_call_get(0), s, filc_call_get(1), end, base);
+}
+
+static unsigned long long ent_strtoull(const char *s, char **end, int base)
+{
+    return filc_strtoull(filc_call_get(0), s, filc_call_get(1), end, base);
+}
+
+static float ent_strtof(const char *s, char **end)
+{
+    return filc_strtof(filc_call_get(0), s, filc_call_get(1), end);
+}
+
+static double ent_strtod(const char *s, char **end)
+{
+    return filc_strtod(filc_call_get(0), s, filc_call_get(1), end);
+}
+
+static long double ent_strtold(const char *s, char **end)
+{
+    return filc_strtold(filc_call_get(0), s, filc_call_get(1), end);
+}
+
+static int ent_atoi(const char *s)
+{
+    return filc_atoi(filc_call_get(0), s);
+}
+
+static long ent_atol(const char *s)
+{
+    return filc_atol(filc_call_get(0), s);
+}
+
+static long long ent_atoll(const char *s)
+{
+    return filc_atoll(filc_call_get(0), s);
+}
+
+static double ent_atof(const char *s)
+{
+    return filc_atof(filc_call_get(0), s);
+}
+
+#define FILC_NENTS 91
 static struct {
     const char *name;
     void *real;
@@ -3197,6 +3364,17 @@ static void filc_resolve_libc(void)
     filc_ents[77].name = "stat"; filc_ents[77].entry = (void *)ent_stat;
     filc_ents[78].name = "lstat"; filc_ents[78].entry = (void *)ent_lstat;
     filc_ents[79].name = "fstat"; filc_ents[79].entry = (void *)ent_fstat;
+    filc_ents[80].name = "strtol"; filc_ents[80].entry = (void *)ent_strtol;
+    filc_ents[81].name = "strtoll"; filc_ents[81].entry = (void *)ent_strtoll;
+    filc_ents[82].name = "strtoul"; filc_ents[82].entry = (void *)ent_strtoul;
+    filc_ents[83].name = "strtoull"; filc_ents[83].entry = (void *)ent_strtoull;
+    filc_ents[84].name = "strtof"; filc_ents[84].entry = (void *)ent_strtof;
+    filc_ents[85].name = "strtod"; filc_ents[85].entry = (void *)ent_strtod;
+    filc_ents[86].name = "strtold"; filc_ents[86].entry = (void *)ent_strtold;
+    filc_ents[87].name = "atoi"; filc_ents[87].entry = (void *)ent_atoi;
+    filc_ents[88].name = "atol"; filc_ents[88].entry = (void *)ent_atol;
+    filc_ents[89].name = "atoll"; filc_ents[89].entry = (void *)ent_atoll;
+    filc_ents[90].name = "atof"; filc_ents[90].entry = (void *)ent_atof;
     real_longjmp = (filc_lj_fn)dlsym(RTLD_DEFAULT, "longjmp");
     real__longjmp = (filc_lj_fn)dlsym(RTLD_DEFAULT, "_longjmp");
     real_siglongjmp = (filc_lj_fn)dlsym(RTLD_DEFAULT, "siglongjmp");

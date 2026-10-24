@@ -3,9 +3,11 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-/* The worker blocks in pause(), outside the filc lock. Stop-the-world
- * has to deliver the signal and snapshot that stack. leak() returns
- * before the scrub, so the quarantined pointer is not a live local. */
+/* The worker blocks in sigsuspend(), outside the filc lock.
+ * Stop-the-world has to deliver its signal and snapshot that stack.
+ * leak() returns before the scrub, so the quarantined pointer is not
+ * a live local. SIGUSR1 stays blocked except during sigsuspend, so a
+ * wake that lands between the phase check and the wait stays pending. */
 
 void filc_collect(void);
 unsigned long filc_freed_count(void);
@@ -37,12 +39,17 @@ static void scrub(void)
 
 static void *worker(void *arg)
 {
+    sigset_t block, old;
     (void)arg;
+    sigemptyset(&block);
+    sigaddset(&block, SIGUSR1);
+    if (pthread_sigmask(SIG_BLOCK, &block, &old) != 0)
+        _exit(2);
     leak();
     scrub();
     phase = 1;
     while (phase == 1)
-        pause();
+        sigsuspend(&old);
     return 0;
 }
 

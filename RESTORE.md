@@ -1,18 +1,61 @@
 # Restoring the Fil-C snapshot
 
-This checkout is a colocated Jujutsu and Git repository. The bookmark
-`filc-restore` is the restore point: TinyCC mob `e23dabed` plus the
-optional `-filc` mode. The change id is `knsozxvl`. Look it up rather
-than trusting a Git hash copied from somewhere else:
+This checkout is a colocated Jujutsu and Git repository. There are two
+restore points. `filc-restore-2` is the later one. `filc-restore` is
+the earlier one and stays at change `knsozxvl`. Look a bookmark up
+rather than trusting a Git hash copied from somewhere else:
 
 ```
-jj log -r filc-restore
+jj log -r 'filc-restore-2 | filc-restore'
 ```
 
-`mob` stays on the upstream commit. `filc-restore` is the bookmark that
-holds the Fil-C work. In Git that bookmark is the branch `filc-restore`.
+`mob` stays on the upstream commit. In Git each bookmark is a branch of
+the same name.
 
-## What the snapshot contains
+## Later restore point
+
+`filc-restore-2` is change `wqqtzoou`, the child of `filc-restore`.
+Do not move it. Do not edit that change in place.
+
+It adds, on top of the first snapshot:
+
+- VLA scope leave uncovers objects by the track depth saved at the
+  first VLA. `tests/filc/vla_shrink.c` aborts on the out-of-bounds write.
+- `strtol`, `strtoll`, `strtoul`, `strtoull`, `strtof`, `strtod`,
+  `strtold`, `atoi`, `atol`, `atoll`, and `atof` require a terminator
+  inside the source object. The end pointer keeps that object's
+  capability.
+- `-filc` links `libtcc1-filc.a`. Plain `libtcc1.a` stays
+  uninstrumented so ordinary programs and `make test` still link.
+  `va_list.o` inside the checked archive stays uninstrumented, because
+  `__va_arg` walks a compiler-built `va_list`.
+- `tests/filc/gc_pause.c` waits with `sigsuspend` so a wake signal is
+  not lost.
+
+Build outputs are still not in the snapshot. `make` rebuilds
+`libtcc1-filc.a` with the gcc-built `./tcc -filc`. The self-host
+binaries under `/tmp/filtcc-self/` (`now/tcc`, `s4/tcc`, `s5/tcc`) are
+outside the tree.
+
+On 2026-10-24 this tree completed another three-stage self-host. The
+last binary compiled a program with `-filc` that exited 42, and it
+compiled `lib/filc_rt.c` without `-filc`. The Fil-TCC suite was 152/152
+and `make test` passed. Those two runs used the gcc-built `./tcc`.
+`-filc` is not full Fil-C. System libc was not rebuilt.
+
+Start new work from this snapshot with:
+
+```
+jj new filc-restore-2
+```
+
+## First restore point
+
+The bookmark `filc-restore` is TinyCC mob `e23dabed` plus the first
+optional `-filc` mode. The change id is `knsozxvl`. In Git that
+bookmark is the branch `filc-restore`.
+
+## What filc-restore contains
 
 Parent: `mob` / `mob@origin` at `e23dabed` (`nqylzvwr`), message
 `stdatomic: fix store argument evaluation and signal fence macros`.
@@ -43,12 +86,14 @@ On 2026-10-24 this snapshot had completed the self-host:
 ## See it
 
 ```
-jj log -r filc-restore
-jj show filc-restore
+jj log -r 'filc-restore-2 | filc-restore'
+jj show filc-restore-2
+jj bookmark list filc-restore-2
 jj bookmark list filc-restore
 ```
 
-The bookmark target should stay change `knsozxvl`.
+`filc-restore-2` should stay change `wqqtzoou`. `filc-restore` should
+stay change `knsozxvl`.
 
 ## Return the working copy to it
 
@@ -89,17 +134,19 @@ jj new filc-restore
 ## Keep the bookmark put
 
 These commands retarget bookmarks. Do not aim them at `filc-restore`
-unless you mean to replace the snapshot:
+or `filc-restore-2` unless you mean to replace that snapshot:
 
 ```
 jj bookmark set
 jj bookmark move
 ```
 
-`jj commit` does not move `filc-restore`. After any restore, check:
+`jj commit` does not move `filc-restore` or `filc-restore-2`. After any
+restore, check:
 
 ```
 jj bookmark list filc-restore
+jj bookmark list filc-restore-2
 ```
 
 ## Undo a jj command
