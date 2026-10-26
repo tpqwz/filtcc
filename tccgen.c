@@ -2346,8 +2346,18 @@ static int filc_is_ptr_arg(int t)
     return bt == VT_PTR || bt == VT_FUNC;
 }
 
+/* The va_list is the last argument of every v* printf. */
+static void filc_emit_vprint(int ap_i)
+{
+    filc_push_caparg(ap_i);
+    filc_push_ival(ap_i);
+    filc_finish_intercept(TOK_filc_vprint, 2);
+    gfunc_call(2);
+}
+
 /* Check the format, then the caller rebuilds the real call.
- * is_v skips the argument walk: a va_list hides each %s and %n. */
+ * A v* call checks %s and %n through the va_list instead of
+ * recording each argument. */
 static void filc_emit_fmt(int fmt_i, int var_i, int nb, int is_v)
 {
     int i;
@@ -2355,8 +2365,10 @@ static void filc_emit_fmt(int fmt_i, int var_i, int nb, int is_v)
     filc_push_ival(fmt_i);
     filc_finish_intercept(TOK_filc_fmt_begin, 2);
     gfunc_call(2);
-    if (is_v)
+    if (is_v) {
+        filc_emit_vprint(nb - 1);
         return;
+    }
     for (i = var_i; i < nb; i++) {
         if (filc_is_ptr_arg(filc_sv[i].type.t)) {
             filc_push_caparg(i);
@@ -2587,6 +2599,44 @@ static int filc_try_sort(const char *name, int *pnb)
     return 0;
 }
 
+/* Source index -1 means there is no source string (fscanf, scanf). */
+static void filc_emit_scan(int src_i, int fmt_i, int dest0, int nb)
+{
+    int i;
+    if (src_i >= 0) {
+        filc_push_caparg(src_i);
+        filc_push_ival(src_i);
+        filc_finish_intercept(TOK_filc_strlen, 2);
+        gfunc_call(2);
+    }
+    filc_push_caparg(fmt_i);
+    filc_push_ival(fmt_i);
+    filc_finish_intercept(TOK_filc_fmt_begin, 2);
+    gfunc_call(2);
+    for (i = dest0; i < nb; i++) {
+        if (filc_is_ptr_arg(filc_sv[i].type.t)) {
+            filc_push_caparg(i);
+            filc_push_ival(i);
+            filc_finish_intercept(TOK_filc_fmt_ptr, 2);
+            gfunc_call(2);
+        } else {
+            vpush_helper_func(TOK_filc_fmt_skip);
+            gfunc_call(0);
+        }
+    }
+    vpush_helper_func(TOK_filc_scan_end);
+    gfunc_call(0);
+}
+
+/* Format was recorded by filc_fmt_begin. ap_i is the va_list argument. */
+static void filc_emit_vscan(int ap_i)
+{
+    filc_push_caparg(ap_i);
+    filc_push_ival(ap_i);
+    filc_finish_intercept(TOK_filc_vscan, 2);
+    gfunc_call(2);
+}
+
 /* printf family, stdio passthroughs, and mmap. Returns 1 if rewritten.
  * Direct printf/fprintf/dprintf keep the libc symbol after the checks.
  * *sprintf goes to filc_* so the destination size is enforced. */
@@ -2612,6 +2662,67 @@ static int filc_try_stdio(const char *name, int *pnb, Sym *sym)
         filc_push_ival(0);
         filc_finish_intercept(TOK_filc_perror, 2);
         *pnb = 2;
+        return 1;
+    }
+    if (!strcmp(name, "sscanf") && nb >= 2 && sym) {
+        /* Source and format must contain a NUL. Each storing conversion
+         * then checks its destination. The libc call keeps the original
+         * arguments. %s without a width is rejected by filc_scan_end. */
+        filc_spill_call(nb);
+        filc_emit_scan(0, 1, 2, nb);
+        filc_repush(sym, nb);
+        *pnb = nb;
+        return 1;
+    }
+    if (!strcmp(name, "fscanf") && nb >= 2 && sym) {
+        filc_spill_call(nb);
+        filc_emit_scan(-1, 1, 2, nb);
+        filc_repush(sym, nb);
+        *pnb = nb;
+        return 1;
+    }
+    if (!strcmp(name, "scanf") && nb >= 1 && sym) {
+        filc_spill_call(nb);
+        filc_emit_scan(-1, 0, 1, nb);
+        filc_repush(sym, nb);
+        *pnb = nb;
+        return 1;
+    }
+    if (!strcmp(name, "vsscanf") && nb == 3 && sym) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_strlen, 2);
+        gfunc_call(2);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_fmt_begin, 2);
+        gfunc_call(2);
+        filc_emit_vscan(2);
+        filc_repush(sym, nb);
+        *pnb = nb;
+        return 1;
+    }
+    if (!strcmp(name, "vfscanf") && nb == 3 && sym) {
+        filc_spill_call(nb);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_fmt_begin, 2);
+        gfunc_call(2);
+        filc_emit_vscan(2);
+        filc_repush(sym, nb);
+        *pnb = nb;
+        return 1;
+    }
+    if (!strcmp(name, "vscanf") && nb == 2 && sym) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_fmt_begin, 2);
+        gfunc_call(2);
+        filc_emit_vscan(1);
+        filc_repush(sym, nb);
+        *pnb = nb;
         return 1;
     }
     if (!strcmp(name, "mmap") && nb == 6) {
@@ -3123,6 +3234,54 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         filc_push_ival(1);
         filc_finish_intercept(TOK_filc_fdopen, 3);
         *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "getcwd") && nb == 2) {
+        /* The return is the caller's buffer, so it keeps that object's
+         * capability. A null buffer is handled in the runtime. */
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_getcwd, 3);
+        *pnb = 3;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "dlopen") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_dlopen, 3);
+        *pnb = 3;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "dlsym") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_dlsym, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "dlclose") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_dlclose, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if (!strcmp(name, "dlerror") && nb == 0) {
+        filc_spill_call(nb);
+        filc_finish_intercept(TOK_filc_dlerror, 0);
+        *pnb = 0;
+        filc_ret_mode = FILC_RET_GET;
         return 1;
     }
     if (!strcmp(name, "puts") && nb == 1) {
@@ -8629,18 +8788,32 @@ ST_FUNC void unary(void)
         /* ap, type -> lvalue of the va slot. __va_arg only moves the
          * cursor. A fresh slot (reg save or overflow interior) is covered
          * and, when it holds pointers, filled from the frame's cap cursor.
-         * A memory struct already has aux; do not consume caps for it. */
+         * A memory struct already has aux; do not consume caps for it.
+         * __va_arg is compiled with -filc, so it reads ap from the call
+         * frame. This call is raw and would not push one. Pop that frame
+         * before filc_va_take, which uses the variadic function's cursor. */
         CType type, ty;
         int cls, sz, al, addr, jmp, tmp, i;
         int offs[8], nptr;
-        int va_tok;
+        int va_tok, ap_kind, ap_slot;
         parse_builtin_params(0, "et");
         type = vtop->type;
         vpop();
+        ap_kind = vtop->filc_kind;
+        ap_slot = vtop->filc_slot;
         sz = type_size(&type, &al);
         if (sz < 0)
             sz = 0;
         cls = classify_x86_64_va_arg(&type);
+        if (tcc_state->filc) {
+            vpush_helper_func(TOK_filc_call_push);
+            gfunc_call(0);
+            vpushi(0);
+            filc_push_saved(ap_slot, ap_kind);
+            vpush_helper_func(TOK_filc_call_set);
+            vrott(3);
+            gfunc_call(2);
+        }
         va_tok = tok_alloc("__va_arg", 8)->tok;
         vpushi(cls);
         vpushi(sz);
@@ -8650,6 +8823,10 @@ ST_FUNC void unary(void)
         gfunc_call(4);
         addr = filc_raw_slot();
         filc_store_reg(REG_IRET, VT_PTR, addr);
+        if (tcc_state->filc) {
+            vpush_helper_func(TOK_filc_call_pop);
+            gfunc_call(0);
+        }
         ty.t = VT_PTR;
         ty.ref = NULL;
         vset(&ty, VT_LOCAL | VT_LVAL, addr);

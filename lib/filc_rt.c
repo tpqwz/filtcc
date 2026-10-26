@@ -25,10 +25,15 @@
  * freopen, and fdopen check their path and mode strings. puts and fputs
  * check the string. FILE* stays an opaque libc pointer. fclose, fflush,
  * fputc, putchar, close, and lseek pass their integer or FILE* bits
- * through. Direct printf checks the format string, each %s, and each
- * %n; sprintf refuses to write past its destination object. A vprintf
- * %s and a positional %N$ conversion are not checked beyond the format
- * string. mmap covers the returned mapping; munmap and mprotect must
+ * through. printf checks the format string, each %s, and each %n.
+ * sprintf refuses to write past its destination object. vprintf,
+ * vfprintf, vsprintf, and vsnprintf do the same checks: va_start
+ * remembers which frame owns the register save area, and the walk
+ * takes pointer capabilities from that frame. An indirect printf
+ * walks its call frame the same way. A positional %N$ conversion
+ * is not checked beyond the format string. A dynamic .* precision
+ * requires a terminator instead of a byte count. mmap covers the
+ * returned mapping; munmap and mprotect must
  * name that whole object. qsort is a heapsort whose swaps go through
  * filc_memmove, so an array of pointers keeps its capabilities. The
  * comparator is called with a capability frame. bsearch checks the
@@ -39,7 +44,31 @@
  * the path and the whole struct stat. strtol, strtoll, strtoul,
  * strtoull, strtof, strtod, and strtold require a terminator inside
  * the source object. The end pointer keeps that object's capability.
- * atoi, atol, atoll, and atof check the string the same way. Pointer
+ * atoi, atol, atoll, and atof check the string the same way. getcwd
+ * checks a caller buffer for a writable size bytes and keeps that
+ * object's capability. A null buffer is the glibc extension: the
+ * result is a filc heap object of size bytes, or of the path length
+ * when size is 0, and the libc buffer is freed. sscanf requires a
+ * terminator in the source and the format. Each storing conversion
+ * checks a writable destination of that conversion's size. %s and
+ * scansets need an explicit width. A positional conversion, %p, %m,
+ * and a wide conversion panic instead of calling libc. fscanf and
+ * scanf check the format and each destination the same way. vsscanf,
+ * vfscanf, and vscanf do too: va_start remembers which frame owns the
+ * register save area, and the walk takes pointer capabilities from
+ * that frame, so a wrapper can pass the va_list on. va_start covers the 176-byte register
+ * save area and stores that capability. The overflow cursor is left
+ * alone when a stack argument is already an object there; otherwise
+ * it is a zero-size capability that the first stack va_arg grows to
+ * that slot. dlopen, dlsym, dlclose, and dlerror check strings and
+ * handles. A handle is a zero-size capability. dlsym accepts a null
+ * or (void *)-1 sentinel. A function, or resolved IFUNC code in an
+ * executable segment, can be called and cannot be read. Data is
+ * limited to the symbol size inside its load segment and is read-only
+ * when that segment is not writable. An address with no size and no
+ * executable segment cannot be read or called. dlerror covers the
+ * libc message and leaves it read-only. dlclose drops the handle
+ * only after that mapping is gone. Pointer
  * __atomic_load/store/exchange/compare_exchange
  * update the integer and the capability under the same lock; memory
  * order is ignored, and compare_exchange matches integer bits only.
@@ -62,6 +91,7 @@
 #include <string.h>
 #include <setjmp.h>
 #include <dlfcn.h>
+#include <link.h>
 #include <signal.h>
 #include <ucontext.h>
 #include <stdarg.h>
@@ -79,6 +109,7 @@
 #define FILC_FUNC     2
 #define FILC_HEAP     4
 #define FILC_FREE     8
+#define FILC_DL       16
 
 #define FILC_MAGIC 0xF11C0B17u
 #define FILC_BUCKETS 4096
@@ -1827,8 +1858,11 @@ void *filc_va_take(void)
     return cap;
 }
 
-/* 1 if this address was not an object yet. The compiler then installs
- * variadic caps. 0 means a stack copy already carries aux; do not take. */
+/* 1 if the compiler should install variadic caps.
+ * 0 means a stack copy already carries aux; do not take.
+ * A zero-size object is the overflow cursor from filc_va_start: grow
+ * it to this slot. A larger object is the register save area, whose
+ * base slot still needs caps. Do not cover a second object there. */
 int filc_va_prepare(void *ptr, size_t size)
 {
     filc_object *o;
@@ -1837,20 +1871,124 @@ int filc_va_prepare(void *ptr, size_t size)
     filc_lock();
     o = filc_lookup(ptr);
     filc_unlock();
-    if (o)
+    if (o && o->size == 0) {
+        filc_cover(ptr, size, 0);
+        return 1;
+    }
+    if (o && o->size <= size)
         return 0;
-    filc_cover(ptr, size, 0);
-    filc_track(ptr);
+    if (!o) {
+        filc_cover(ptr, size, 0);
+        filc_track(ptr);
+    }
     return 1;
 }
 
+/* x86_64 SysV register save area: 6 integer regs * 8 + 8 xmm * 16.
+ * The prologue builds it at rbp-200. Offsets in the 24-byte template:
+ * overflow_arg_area at 8, reg_save_area at 16. */
+#define FILC_VA_SAVE 176
+
+/* The variadic frame owns the pointer caps. A later vsscanf may run
+ * in a wrapper, so remember that frame by the save-area address the
+ * va_list still holds. call_va_idx of that frame stays the cursor
+ * va_arg already uses. */
+struct filc_va_bind {
+    void *save;
+    int depth;
+};
+static __thread struct filc_va_bind *filc_va_binds;
+static __thread int filc_va_nbinds, filc_va_bindcap;
+
+static void filc_va_bind(void *save)
+{
+    int depth, i;
+    struct filc_va_bind *p;
+    if (!save)
+        return;
+    depth = call_depth - 1;
+    if (depth < 0)
+        return;
+    i = 0;
+    while (i < filc_va_nbinds) {
+        if (filc_va_binds[i].depth >= call_depth) {
+            filc_va_binds[i] = filc_va_binds[--filc_va_nbinds];
+            continue;
+        }
+        i++;
+    }
+    for (i = 0; i < filc_va_nbinds; i++) {
+        if (filc_va_binds[i].save == save) {
+            filc_va_binds[i].depth = depth;
+            return;
+        }
+    }
+    if (filc_va_nbinds >= filc_va_bindcap) {
+        int nc = filc_va_bindcap ? filc_va_bindcap * 2 : 16;
+        p = (struct filc_va_bind *)realloc(filc_va_binds,
+            (size_t)nc * sizeof(*p));
+        if (!p)
+            filc_panic("out of memory");
+        filc_va_binds = p;
+        filc_va_bindcap = nc;
+    }
+    filc_va_binds[filc_va_nbinds].save = save;
+    filc_va_binds[filc_va_nbinds].depth = depth;
+    filc_va_nbinds++;
+}
+
+static void *filc_take_save(void *save)
+{
+    int i, depth, idx;
+    if (!save)
+        return NULL;
+    for (i = 0; i < filc_va_nbinds; i++) {
+        if (filc_va_binds[i].save != save)
+            continue;
+        depth = filc_va_binds[i].depth;
+        if (depth < 0 || depth >= call_depth)
+            return NULL;
+        idx = call_va_idx[depth];
+        if (idx < 0 || idx >= FILC_MAX_PTR_ARGS)
+            return NULL;
+        call_va_idx[depth] = idx + 1;
+        return call_caps[depth][idx];
+    }
+    return NULL;
+}
+
 /* Copy the 24-byte SysV va_list template from the caller's frame.
- * The variadic prologue stores it at rbp-24. */
+ * The variadic prologue stores it at rbp-24. reg_save_area becomes a
+ * real capability so an instrumented __va_arg can walk it. The overflow
+ * area has no stored length. Covering a span would grow an argument
+ * object that already starts there, or run into the caller's frame.
+ * A missing object gets a zero-size cursor; filc_va_prepare grows the
+ * first slot. __va_arg advances that cursor and does not dereference it. */
 void filc_va_start(void *lower, void *ap)
 {
     char *src = (char *)__builtin_frame_address(1) - 24;
+    char *save, *ov;
+    filc_object *o;
     filc_check(lower, ap, 24, 1);
     memcpy(ap, src, 24);
+    save = *(char **)((char *)ap + 16);
+    if (save) {
+        filc_cover(save, FILC_VA_SAVE, 0);
+        filc_track(save);
+        filc_store_ptr(lower, (char *)ap + 16, save, (uintptr_t)save);
+        filc_va_bind(save);
+    }
+    ov = *(char **)((char *)ap + 8);
+    if (!ov)
+        return;
+    filc_lock();
+    o = filc_lookup(ov);
+    filc_unlock();
+    if (!o) {
+        filc_cover(ov, 0, 0);
+        filc_track(ov);
+    }
+    filc_store_ptr(lower, (char *)ap + 8, ov, (uintptr_t)ov);
 }
 
 /* size*nmemb, or panic. The product is only the checked length; libc
@@ -1910,6 +2048,272 @@ char *filc_fgets(void *lower, char *s, int size, FILE *stream)
     r = fgets(s, size, stream);
     filc_ret_cap = r ? lower : NULL;
     return r;
+}
+
+/* A caller buffer must be writable for size bytes. The glibc extension
+ * getcwd(NULL, size) mallocs; that pointer would be foreign, so copy it
+ * into a filc heap object of the same size (or the path length if size
+ * is 0) and free the libc buffer. */
+char *filc_getcwd(void *lower, char *buf, size_t size)
+{
+    char *r;
+    if (!buf) {
+        size_t n;
+        char *d;
+        r = getcwd(NULL, size);
+        if (!r) {
+            filc_ret_cap = NULL;
+            return NULL;
+        }
+        n = size ? size : strlen(r) + 1;
+        d = filc_malloc(n);
+        if (!d) {
+            free(r);
+            filc_ret_cap = NULL;
+            return NULL;
+        }
+        memcpy(d, r, n);
+        free(r);
+        filc_ret_cap = d;
+        return d;
+    }
+    filc_check(lower, buf, size, 1);
+    r = getcwd(buf, size);
+    filc_ret_cap = r ? lower : NULL;
+    return r;
+}
+
+/* A dlopen handle is not a byte object and not a heap object. free()
+ * must not release linker memory, and the collector does not sweep it.
+ * The flag is set here because filc_cover does not add flags to an
+ * object it already knows. */
+struct filc_seg {
+    uintptr_t addr;
+    uintptr_t hi;
+    int found;
+    int writable;
+    int exec;
+};
+
+static int filc_seg_cb(struct dl_phdr_info *info, size_t sz, void *data)
+{
+    struct filc_seg *s = data;
+    int i;
+    (void)sz;
+    for (i = 0; i < (int)info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        uintptr_t lo, hi;
+        if (ph->p_type != PT_LOAD)
+            continue;
+        lo = (uintptr_t)info->dlpi_addr + (uintptr_t)ph->p_vaddr;
+        hi = lo + (uintptr_t)ph->p_memsz;
+        if (s->addr >= lo && s->addr < hi) {
+            s->found = 1;
+            s->writable = (ph->p_flags & PF_W) != 0;
+            s->exec = (ph->p_flags & PF_X) != 0;
+            s->hi = hi;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+struct filc_base {
+    uintptr_t base;
+    int found;
+};
+
+static int filc_base_cb(struct dl_phdr_info *info, size_t sz, void *data)
+{
+    struct filc_base *b = data;
+    (void)sz;
+    if ((uintptr_t)info->dlpi_addr == b->base) {
+        b->found = 1;
+        return 1;
+    }
+    return 0;
+}
+
+static int filc_mapping_present(uintptr_t base)
+{
+    struct filc_base b;
+    b.base = base;
+    b.found = 0;
+    dl_iterate_phdr(filc_base_cb, &b);
+    return b.found;
+}
+
+static void filc_dl_handle(void *lower, void *ptr)
+{
+    filc_object *o;
+    if (!ptr || lower != ptr)
+        filc_panic("bad capability");
+    filc_lock();
+    o = filc_lookup(ptr);
+    filc_unlock();
+    if (!o || o->payload != ptr || (o->flags & FILC_FREE) ||
+        !(o->flags & FILC_DL))
+        filc_panic("bad capability");
+}
+
+static void filc_publish_func(void *p)
+{
+    filc_object *o;
+    filc_lock();
+    o = filc_lookup(p);
+    filc_unlock();
+    if (o && (o->flags & FILC_FREE)) {
+        filc_ret_cap = NULL;
+        return;
+    }
+    if (!o)
+        filc_cover(p, 0, FILC_FUNC);
+    filc_ret_cap = p;
+}
+
+/* base is the symbol address. An existing object is left alone so a
+ * -filc global is not grown. A new object is the symbol size, clamped
+ * to the load segment that contains base. */
+static void filc_publish_data(void *base, size_t sz, unsigned flags)
+{
+    filc_object *o;
+    filc_lock();
+    o = filc_lookup(base);
+    filc_unlock();
+    if (o && (o->flags & FILC_FREE)) {
+        filc_ret_cap = NULL;
+        return;
+    }
+    if (!o)
+        filc_cover(base, sz, flags);
+    filc_ret_cap = base;
+}
+
+/* Classify the address dlsym returned. Do not substitute an ent_*
+ * wrapper: the caller may store the bits as an integer relocation. */
+static void filc_publish_sym(void *p)
+{
+    Dl_info info;
+    const ElfW(Sym) *sym = NULL;
+    struct filc_seg seg;
+    unsigned type;
+    void *base;
+    size_t sz;
+    unsigned flags;
+
+    if (!p) {
+        filc_ret_cap = NULL;
+        return;
+    }
+    memset(&info, 0, sizeof info);
+    if (dladdr1(p, &info, (void **)&sym, RTLD_DL_SYMENT) && sym) {
+        type = ELF64_ST_TYPE(sym->st_info);
+        if (type == STT_FUNC || type == STT_GNU_IFUNC) {
+            filc_publish_func(p);
+            return;
+        }
+        if (type == STT_OBJECT && sym->st_size > 0) {
+            base = info.dli_saddr ? info.dli_saddr : p;
+            sz = (size_t)sym->st_size;
+            memset(&seg, 0, sizeof seg);
+            seg.addr = (uintptr_t)base;
+            dl_iterate_phdr(filc_seg_cb, &seg);
+            if (!seg.found || (uintptr_t)base >= seg.hi)
+                sz = 0;
+            else if (sz > seg.hi - (uintptr_t)base)
+                sz = (size_t)(seg.hi - (uintptr_t)base);
+            flags = (sz && seg.found && !seg.writable) ? FILC_READONLY : 0;
+            filc_publish_data(base, sz, flags);
+            return;
+        }
+        /* TLS, a zero-size object, or any other named type. Do not
+         * turn it into code just because the bytes are executable. */
+        base = info.dli_saddr ? info.dli_saddr : p;
+        filc_publish_data(base, 0, 0);
+        return;
+    }
+    /* Resolved IFUNC often has no symbol at the implementation.
+     * Executable, non-writable bytes are still code. Anything else
+     * (TLS, unknown data) is fail-closed: size 0, not callable. */
+    memset(&seg, 0, sizeof seg);
+    seg.addr = (uintptr_t)p;
+    dl_iterate_phdr(filc_seg_cb, &seg);
+    if (seg.found && seg.exec && !seg.writable)
+        filc_publish_func(p);
+    else
+        filc_publish_data(p, 0, 0);
+}
+
+void *filc_dlopen(void *lower, const char *file, int flags)
+{
+    void *h;
+    filc_object *o;
+    if (file)
+        filc_strlen(lower, file);
+    h = dlopen(file, flags);
+    if (!h) {
+        filc_ret_cap = NULL;
+        return NULL;
+    }
+    filc_cover(h, 0, FILC_DL);
+    filc_lock();
+    o = filc_lookup(h);
+    if (o && o->size == 0 && !(o->flags & (FILC_FREE | FILC_HEAP | FILC_FUNC)))
+        o->flags |= FILC_DL;
+    if (!o || !(o->flags & FILC_DL)) {
+        filc_unlock();
+        filc_panic("bad capability");
+    }
+    filc_unlock();
+    filc_ret_cap = h;
+    return h;
+}
+
+void *filc_dlsym(void *hl, void *handle, void *nl, const char *name)
+{
+    void *p;
+    if (handle != RTLD_DEFAULT && handle != RTLD_NEXT)
+        filc_dl_handle(hl, handle);
+    filc_strlen(nl, name);
+    p = dlsym(handle, name);
+    filc_publish_sym(p);
+    return p;
+}
+
+int filc_dlclose(void *lower, void *handle)
+{
+    struct link_map *map = NULL;
+    uintptr_t base = 0;
+    int have_base = 0;
+    int r;
+    filc_dl_handle(lower, handle);
+    if (dlinfo(handle, RTLD_DI_LINKMAP, &map) == 0 && map) {
+        base = (uintptr_t)map->l_addr;
+        have_base = 1;
+    }
+    r = dlclose(handle);
+    if (r != 0 || !have_base)
+        return r;
+    if (!filc_mapping_present(base))
+        filc_uncover(handle);
+    return r;
+}
+
+char *filc_dlerror(void)
+{
+    char *s;
+    size_t n;
+    s = dlerror();
+    if (!s) {
+        filc_ret_cap = NULL;
+        return NULL;
+    }
+    n = strlen(s);
+    if (n == (size_t)-1)
+        filc_panic("out of bounds");
+    filc_cover(s, n + 1, FILC_READONLY);
+    filc_ret_cap = s;
+    return s;
 }
 
 /* Cover strlen+1 of the libc string. lower == that pointer, and the
@@ -2098,10 +2502,11 @@ static size_t filc_writable_tail(void *lower, void *ptr)
 }
 
 /* Direct printf records each argument, then filc_fmt_end walks the
- * format. A v* call and an indirect call only strlen the format: the
- * va_list is opaque, so a %s in there is not checked. A positional
- * %N$ stops the walk after the format has been strlen'd. A dynamic
- * .* precision requires a terminator instead of a byte count. */
+ * format. vprintf and an indirect printf walk the same conversions.
+ * A pointer argument takes one capability. An int, a double, or a
+ * long double only advances the va_list, so the next %s stays aligned.
+ * A positional %N$ stops the walk after the format has been strlen'd.
+ * A dynamic .* precision requires a terminator instead of a byte count. */
 #define FILC_FMT_MAX 64
 static __thread int filc_fmt_n;
 static __thread const char *filc_fmt_s;
@@ -2158,19 +2563,80 @@ static int filc_fmt_pos(const char *s)
     return *s == '$';
 }
 
-void filc_fmt_end(void)
+/* cls 0 is a general register, 1 a double, 2 a long double.
+ * want_ptr means this argument is a pointer. Mode 0 then requires a
+ * recorded pointer. Modes 1 and 2 va_arg it and take one capability.
+ * __va_arg is instrumented, so each va_arg gets its own one-entry
+ * frame. That frame is popped before the capability is read, or the
+ * caller's caps would be hidden. */
+static void *filc_fmt_advance(int cls, va_list *ap, void *base)
+{
+    void *p;
+    filc_call_push();
+    filc_call_set(0, base);
+    if (cls == 1) {
+        (void)va_arg(*ap, double);
+        p = NULL;
+    } else if (cls == 2) {
+        (void)va_arg(*ap, long double);
+        p = NULL;
+    } else {
+        p = va_arg(*ap, void *);
+    }
+    filc_call_pop();
+    return p;
+}
+
+static void filc_fmt_consume(int mode, va_list *ap, int *ai, int *cap_i,
+    void *save, int cls, int want_ptr, void **ocap, void **op)
+{
+    void *p;
+    int i;
+    if (mode == 0) {
+        i = filc_fmt_take(ai);
+        if (!want_ptr)
+            return;
+        if (!filc_fmt_isptr[i])
+            filc_panic("out of bounds");
+        if (ocap)
+            *ocap = filc_fmt_cap[i];
+        if (op)
+            *op = filc_fmt_arg[i];
+        return;
+    }
+    p = filc_fmt_advance(cls, ap, (void *)*ap);
+    if (!want_ptr)
+        return;
+    if (op)
+        *op = p;
+    if (mode == 1) {
+        if (ocap)
+            *ocap = filc_call_get(*cap_i);
+        (*cap_i)++;
+    } else if (ocap) {
+        *ocap = filc_take_save(save);
+    }
+}
+
+/* mode 0: arguments recorded by filc_fmt_ptr. mode 1: this call's
+ * frame (indirect printf). mode 2: the va_list save area bound at
+ * va_start (vprintf and a wrapper that passes the va_list on). */
+static void filc_fmt_walk(int mode, va_list *ap, int cap_i, void *save)
 {
     const char *s;
-    int ai, star_prec, has_prec, len, i;
-    long prec;
-    char spec;
-    size_t sz;
+    int ai;
 
     s = filc_fmt_s;
     ai = 0;
     if (!s)
         return;
     while (*s) {
+        int star_prec, has_prec, len, cls, want;
+        long prec;
+        char spec;
+        size_t sz;
+        void *cap, *p;
+
         if (*s != '%') {
             s++;
             continue;
@@ -2187,7 +2653,7 @@ void filc_fmt_end(void)
         if (filc_fmt_pos(s))
             return;
         if (*s == '*') {
-            (void)filc_fmt_take(&ai);
+            filc_fmt_consume(mode, ap, &ai, &cap_i, save, 0, 0, NULL, NULL);
             s++;
         } else {
             while (*s >= '0' && *s <= '9')
@@ -2201,7 +2667,7 @@ void filc_fmt_end(void)
             if (filc_fmt_pos(s))
                 return;
             if (*s == '*') {
-                (void)filc_fmt_take(&ai);
+                filc_fmt_consume(mode, ap, &ai, &cap_i, save, 0, 0, NULL, NULL);
                 star_prec = 1;
                 s++;
             } else {
@@ -2245,33 +2711,295 @@ void filc_fmt_end(void)
         s++;
         if (spec == 'm')
             continue;
-        /* %ls is a wide string. Do not walk it as bytes. */
-        if (spec == 's' && len != 3) {
-            i = filc_fmt_take(&ai);
-            if (!filc_fmt_isptr[i])
-                filc_panic("out of bounds");
-            if (star_prec || !has_prec)
-                filc_strlen(filc_fmt_cap[i], (const char *)filc_fmt_arg[i]);
-            else
-                filc_check(filc_fmt_cap[i], filc_fmt_arg[i], (size_t)prec, 0);
+        /* %ls is a wide string. Consume the pointer and do not walk bytes.
+         * %p is a pointer too. Mode 0 still only requires a recorded
+         * pointer for %s and %n, which is what direct printf did. */
+        want = (spec == 'n') || (spec == 's' && len != 3);
+        if (mode != 0 && (spec == 's' || spec == 'n' || spec == 'p'))
+            want = 1;
+        if (spec == 's' || spec == 'n' || spec == 'p') {
+            cap = NULL;
+            p = NULL;
+            filc_fmt_consume(mode, ap, &ai, &cap_i, save, 0, want, &cap, &p);
+            if (spec == 's' && len != 3) {
+                if (star_prec || !has_prec)
+                    filc_strlen(cap, (const char *)p);
+                else
+                    filc_check(cap, p, (size_t)prec, 0);
+            } else if (spec == 'n') {
+                sz = 4;
+                if (len == 1)
+                    sz = 1;
+                else if (len == 2)
+                    sz = 2;
+                else if (len >= 3)
+                    sz = 8;
+                filc_check(cap, p, sz, 1);
+            }
             continue;
         }
-        if (spec == 'n') {
-            i = filc_fmt_take(&ai);
-            if (!filc_fmt_isptr[i])
-                filc_panic("out of bounds");
-            sz = 4;
-            if (len == 1)
-                sz = 1;
-            else if (len == 2)
-                sz = 2;
-            else if (len >= 3)
-                sz = 8;
-            filc_check(filc_fmt_cap[i], filc_fmt_arg[i], sz, 1);
-            continue;
-        }
-        (void)filc_fmt_take(&ai);
+        cls = 0;
+        if (spec == 'a' || spec == 'A' || spec == 'e' || spec == 'E'
+            || spec == 'f' || spec == 'F' || spec == 'g' || spec == 'G')
+            cls = (len == 6) ? 2 : 1;
+        filc_fmt_consume(mode, ap, &ai, &cap_i, save, cls, 0, NULL, NULL);
     }
+}
+
+void filc_fmt_end(void)
+{
+    filc_fmt_walk(0, NULL, 0, NULL);
+}
+
+static void filc_fmt_va(int mode, va_list *ap, int cap_i, void *save)
+{
+    void *base;
+    base = (void *)*ap;
+    filc_cover(base, sizeof(va_list), 0);
+    filc_fmt_walk(mode, ap, cap_i, save);
+    filc_uncover(base);
+}
+
+/* Check each %s and %n hidden in ap. The format was recorded by
+ * filc_fmt_begin. x86_64 keeps reg_save_area at offset 16. */
+void filc_vprint(void *al, va_list ap)
+{
+    va_list aq;
+    void *save;
+    filc_check(al, ap, sizeof(va_list), 1);
+#if defined(__x86_64__)
+    save = *(void **)((char *)ap + 16);
+#else
+    (void)save;
+    filc_panic("out of bounds");
+#endif
+    va_copy(aq, ap);
+    filc_fmt_va(2, &aq, 0, save);
+    va_end(aq);
+}
+
+/* Indirect printf. var_cap is the first variadic pointer. An int
+ * argument is not a capability, so it does not advance that index. */
+static void filc_fmt_indirect(int fmt_cap, const char *fmt, va_list ap,
+    int var_cap)
+{
+    va_list aq;
+    filc_fmt_begin(filc_call_get(fmt_cap), fmt);
+    va_copy(aq, ap);
+    filc_fmt_va(1, &aq, var_cap, NULL);
+    va_end(aq);
+}
+
+/* scanf integer size. len matches the printf walker: 0 int, 1 hh, 2 h,
+ * 3 l, 4 ll, 5 z/t/j, 6 L. */
+static size_t filc_scan_int_size(int len)
+{
+    if (len == 1)
+        return 1;
+    if (len == 2)
+        return 2;
+    if (len == 4)
+        return 8;
+    if (len == 3 || len == 5)
+        return sizeof(long);
+    if (len == 6)
+        filc_panic("unchecked sscanf");
+    return 4;
+}
+
+/* mode 0: destinations recorded by filc_fmt_ptr.
+ * mode 1: this call's frame (indirect sscanf/fscanf/scanf).
+ * mode 2: the va_list save area bound at va_start. */
+static void *filc_scan_arg(va_list *ap, void *base);
+static void filc_scan_check_one(int *ai, int mode, va_list *ap, int *cap_i,
+    void *save, size_t sz)
+{
+    void *p, *cap;
+    int i;
+    if (mode == 1) {
+        p = filc_scan_arg(ap, (void *)*ap);
+        cap = filc_call_get(*cap_i);
+        (*cap_i)++;
+    } else if (mode == 2) {
+        p = filc_scan_arg(ap, (void *)*ap);
+        cap = filc_take_save(save);
+    } else {
+        i = filc_fmt_take(ai);
+        if (!filc_fmt_isptr[i])
+            filc_panic("out of bounds");
+        p = filc_fmt_arg[i];
+        cap = filc_fmt_cap[i];
+    }
+    filc_check(cap, p, sz, 1);
+}
+
+/* Direct sscanf records destinations with the printf helpers, then
+ * calls this. An indirect sscanf passes mode 1 so the pointers come
+ * from the va_list and the caps come from the call frame. vsscanf
+ * passes mode 2 and the register save area. */
+static void filc_scan_walk(int mode, va_list *ap, int cap_i, void *save)
+{
+    const char *s;
+    int ai;
+
+    s = filc_fmt_s;
+    ai = 0;
+    if (!s)
+        return;
+    while (*s) {
+        int suppress, len;
+        long width;
+        char spec;
+        size_t sz;
+
+        if (*s != '%') {
+            s++;
+            continue;
+        }
+        s++;
+        if (*s == '%') {
+            s++;
+            continue;
+        }
+        suppress = 0;
+        if (*s == '*') {
+            suppress = 1;
+            s++;
+        }
+        if (filc_fmt_pos(s) || *s == 'm')
+            filc_panic("unchecked sscanf");
+        width = -1;
+        if (*s >= '0' && *s <= '9') {
+            width = 0;
+            while (*s >= '0' && *s <= '9') {
+                if (width > 100000000L)
+                    filc_panic("out of bounds");
+                width = width * 10 + (long)(*s - '0');
+                s++;
+            }
+        }
+        len = 0;
+        if (*s == 'h') {
+            s++;
+            if (*s == 'h') {
+                len = 1;
+                s++;
+            } else {
+                len = 2;
+            }
+        } else if (*s == 'l') {
+            s++;
+            if (*s == 'l') {
+                len = 4;
+                s++;
+            } else {
+                len = 3;
+            }
+        } else if (*s == 'z' || *s == 't' || *s == 'j' || *s == 'q') {
+            len = (*s == 'q') ? 4 : 5;
+            s++;
+        } else if (*s == 'L') {
+            len = 6;
+            s++;
+        }
+        spec = *s;
+        if (spec == 0)
+            filc_panic("out of bounds");
+        s++;
+        sz = 0;
+        switch (spec) {
+        case 'd':
+        case 'i':
+        case 'u':
+        case 'o':
+        case 'x':
+        case 'X':
+        case 'n':
+            sz = filc_scan_int_size(len);
+            break;
+        case 'c':
+            if (len == 3)
+                filc_panic("unchecked sscanf");
+            sz = (width > 0) ? (size_t)width : 1;
+            break;
+        case 's':
+            /* A missing width would let libc write until whitespace. */
+            if (len == 3 || width < 0)
+                filc_panic("unchecked sscanf");
+            sz = (size_t)width + 1;
+            break;
+        case 'a':
+        case 'e':
+        case 'f':
+        case 'g':
+        case 'A':
+        case 'E':
+        case 'F':
+        case 'G':
+            if (len == 6)
+                sz = sizeof(long double);
+            else if (len == 3 || len == 4)
+                sz = sizeof(double);
+            else if (len == 0)
+                sz = sizeof(float);
+            else
+                filc_panic("unchecked sscanf");
+            break;
+        default:
+            filc_panic("unchecked sscanf");
+        }
+        if (suppress)
+            continue;
+        filc_scan_check_one(&ai, mode, ap, &cap_i, save, sz);
+    }
+}
+
+void filc_scan_end(void)
+{
+    filc_scan_walk(0, NULL, 0, NULL);
+}
+
+/* __va_arg in libtcc1-filc.a is instrumented. It reads call cap 0 as
+ * the va_list. This file is not compiled with -filc, so the call would
+ * otherwise see the caller's frame. Cover the list the walk advances
+ * (a copy; libc still uses the caller's list) and drop it after.
+ * The frame exists only for the va_arg, so mode 1 still reads
+ * destination caps from the call that entered the runtime. */
+static void *filc_scan_arg(va_list *ap, void *base)
+{
+    void *p;
+    filc_call_push();
+    filc_call_set(0, base);
+    p = va_arg(*ap, void *);
+    filc_call_pop();
+    return p;
+}
+
+static void filc_scan_va(int mode, va_list *ap, int cap_i, void *save)
+{
+    void *base;
+    base = (void *)*ap;
+    filc_cover(base, sizeof(va_list), 0);
+    filc_scan_walk(mode, ap, cap_i, save);
+    filc_uncover(base);
+}
+
+/* Check each destination hidden in ap. The format was recorded by
+ * filc_fmt_begin. x86_64 keeps reg_save_area at offset 16. */
+void filc_vscan(void *al, va_list ap)
+{
+    va_list aq;
+    void *save;
+    filc_check(al, ap, sizeof(va_list), 1);
+#if defined(__x86_64__)
+    save = *(void **)((char *)ap + 16);
+#else
+    (void)save;
+    filc_panic("unchecked sscanf");
+#endif
+    va_copy(aq, ap);
+    filc_scan_va(2, &aq, 0, save);
+    va_end(aq);
 }
 
 /* The printed text plus its NUL must fit. vsnprintf never writes past
@@ -2945,14 +3673,15 @@ static int ent_mprotect(void *addr, size_t length, int prot)
     return filc_mprotect(filc_call_get(0), addr, length, prot);
 }
 
-/* Indirect printf checks the format string only. A %s in the va_list
- * is not visible here. Destination bounds still apply to *sprintf. */
+/* Variadic caps start after the named pointers. dprintf's fd and
+ * snprintf's size are integers, so they are not capabilities.
+ * Destination bounds still apply to *sprintf. */
 static int ent_printf(const char *fmt, ...)
 {
     va_list ap;
     int r;
-    filc_strlen(filc_call_get(0), fmt);
     va_start(ap, fmt);
+    filc_fmt_indirect(0, fmt, ap, 1);
     r = vprintf(fmt, ap);
     va_end(ap);
     return r;
@@ -2962,8 +3691,8 @@ static int ent_fprintf(FILE *stream, const char *fmt, ...)
 {
     va_list ap;
     int r;
-    filc_strlen(filc_call_get(1), fmt);
     va_start(ap, fmt);
+    filc_fmt_indirect(1, fmt, ap, 2);
     r = vfprintf(stream, fmt, ap);
     va_end(ap);
     return r;
@@ -2973,8 +3702,8 @@ static int ent_sprintf(char *dst, const char *fmt, ...)
 {
     va_list ap;
     int r;
-    filc_strlen(filc_call_get(1), fmt);
     va_start(ap, fmt);
+    filc_fmt_indirect(1, fmt, ap, 2);
     r = filc_vsprintf(filc_call_get(0), dst, fmt, ap);
     va_end(ap);
     return r;
@@ -2984,8 +3713,8 @@ static int ent_snprintf(char *dst, size_t n, const char *fmt, ...)
 {
     va_list ap;
     int r;
-    filc_strlen(filc_call_get(1), fmt);
     va_start(ap, fmt);
+    filc_fmt_indirect(1, fmt, ap, 2);
     r = filc_vsnprintf(filc_call_get(0), dst, n, fmt, ap);
     va_end(ap);
     return r;
@@ -2995,8 +3724,8 @@ static int ent_dprintf(int fd, const char *fmt, ...)
 {
     va_list ap;
     int r;
-    filc_strlen(filc_call_get(0), fmt);
     va_start(ap, fmt);
+    filc_fmt_indirect(0, fmt, ap, 1);
     r = vdprintf(fd, fmt, ap);
     va_end(ap);
     return r;
@@ -3004,25 +3733,29 @@ static int ent_dprintf(int fd, const char *fmt, ...)
 
 static int ent_vprintf(const char *fmt, va_list ap)
 {
-    filc_strlen(filc_call_get(0), fmt);
+    filc_fmt_begin(filc_call_get(0), fmt);
+    filc_vprint(filc_call_get(1), ap);
     return vprintf(fmt, ap);
 }
 
 static int ent_vfprintf(FILE *stream, const char *fmt, va_list ap)
 {
-    filc_strlen(filc_call_get(1), fmt);
+    filc_fmt_begin(filc_call_get(1), fmt);
+    filc_vprint(filc_call_get(2), ap);
     return vfprintf(stream, fmt, ap);
 }
 
 static int ent_vsprintf(char *dst, const char *fmt, va_list ap)
 {
-    filc_strlen(filc_call_get(1), fmt);
+    filc_fmt_begin(filc_call_get(1), fmt);
+    filc_vprint(filc_call_get(2), ap);
     return filc_vsprintf(filc_call_get(0), dst, fmt, ap);
 }
 
 static int ent_vsnprintf(char *dst, size_t n, const char *fmt, va_list ap)
 {
-    filc_strlen(filc_call_get(1), fmt);
+    filc_fmt_begin(filc_call_get(1), fmt);
+    filc_vprint(filc_call_get(2), ap);
     return filc_vsnprintf(filc_call_get(0), dst, n, fmt, ap);
 }
 
@@ -3262,7 +3995,103 @@ static double ent_atof(const char *s)
     return filc_atof(filc_call_get(0), s);
 }
 
-#define FILC_NENTS 91
+static char *ent_getcwd(char *buf, size_t size)
+{
+    return filc_getcwd(filc_call_get(0), buf, size);
+}
+
+static void *ent_dlopen(const char *file, int flags)
+{
+    return filc_dlopen(filc_call_get(0), file, flags);
+}
+
+static void *ent_dlsym(void *handle, const char *name)
+{
+    return filc_dlsym(filc_call_get(0), handle, filc_call_get(1), name);
+}
+
+static int ent_dlclose(void *handle)
+{
+    return filc_dlclose(filc_call_get(0), handle);
+}
+
+static char *ent_dlerror(void)
+{
+    return filc_dlerror();
+}
+
+static int ent_sscanf(const char *s, const char *fmt, ...)
+{
+    va_list ap, aq;
+    int r;
+    filc_strlen(filc_call_get(0), s);
+    filc_fmt_begin(filc_call_get(1), fmt);
+    va_start(ap, fmt);
+    va_copy(aq, ap);
+    filc_scan_va(1, &aq, 2, NULL);
+    va_end(aq);
+    r = vsscanf(s, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+static int ent_fscanf(FILE *fp, const char *fmt, ...)
+{
+    va_list ap, aq;
+    int r;
+    filc_fmt_begin(filc_call_get(1), fmt);
+    va_start(ap, fmt);
+    va_copy(aq, ap);
+    filc_scan_va(1, &aq, 2, NULL);
+    va_end(aq);
+    r = vfscanf(fp, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+static int ent_scanf(const char *fmt, ...)
+{
+    va_list ap, aq;
+    int r;
+    filc_fmt_begin(filc_call_get(0), fmt);
+    va_start(ap, fmt);
+    va_copy(aq, ap);
+    filc_scan_va(1, &aq, 1, NULL);
+    va_end(aq);
+    r = vscanf(fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+static int ent_vsscanf(const char *s, const char *fmt, va_list ap)
+{
+    int r;
+    filc_strlen(filc_call_get(0), s);
+    filc_fmt_begin(filc_call_get(1), fmt);
+    filc_vscan(filc_call_get(2), ap);
+    r = vsscanf(s, fmt, ap);
+    return r;
+}
+
+static int ent_vfscanf(FILE *fp, const char *fmt, va_list ap)
+{
+    int r;
+    filc_fmt_begin(filc_call_get(1), fmt);
+    filc_vscan(filc_call_get(2), ap);
+    r = vfscanf(fp, fmt, ap);
+    return r;
+}
+
+static int ent_vscanf(const char *fmt, va_list ap)
+{
+    int r;
+    filc_fmt_begin(filc_call_get(0), fmt);
+    filc_vscan(filc_call_get(1), ap);
+    r = vscanf(fmt, ap);
+    return r;
+}
+
+#define FILC_NENTS 102
 static struct {
     const char *name;
     void *real;
@@ -3375,6 +4204,17 @@ static void filc_resolve_libc(void)
     filc_ents[88].name = "atol"; filc_ents[88].entry = (void *)ent_atol;
     filc_ents[89].name = "atoll"; filc_ents[89].entry = (void *)ent_atoll;
     filc_ents[90].name = "atof"; filc_ents[90].entry = (void *)ent_atof;
+    filc_ents[91].name = "getcwd"; filc_ents[91].entry = (void *)ent_getcwd;
+    filc_ents[92].name = "sscanf"; filc_ents[92].entry = (void *)ent_sscanf;
+    filc_ents[93].name = "dlopen"; filc_ents[93].entry = (void *)ent_dlopen;
+    filc_ents[94].name = "dlsym"; filc_ents[94].entry = (void *)ent_dlsym;
+    filc_ents[95].name = "dlclose"; filc_ents[95].entry = (void *)ent_dlclose;
+    filc_ents[96].name = "dlerror"; filc_ents[96].entry = (void *)ent_dlerror;
+    filc_ents[97].name = "fscanf"; filc_ents[97].entry = (void *)ent_fscanf;
+    filc_ents[98].name = "scanf"; filc_ents[98].entry = (void *)ent_scanf;
+    filc_ents[99].name = "vsscanf"; filc_ents[99].entry = (void *)ent_vsscanf;
+    filc_ents[100].name = "vfscanf"; filc_ents[100].entry = (void *)ent_vfscanf;
+    filc_ents[101].name = "vscanf"; filc_ents[101].entry = (void *)ent_vscanf;
     real_longjmp = (filc_lj_fn)dlsym(RTLD_DEFAULT, "longjmp");
     real__longjmp = (filc_lj_fn)dlsym(RTLD_DEFAULT, "_longjmp");
     real_siglongjmp = (filc_lj_fn)dlsym(RTLD_DEFAULT, "siglongjmp");
@@ -3382,6 +4222,20 @@ static void filc_resolve_libc(void)
         real__longjmp = real_longjmp;
     for (i = 0; i < FILC_NENTS; i++)
         filc_ents[i].real = dlsym(RTLD_DEFAULT, filc_ents[i].name);
+    /* glibc headers alias these to __isoc99_*. Taking the address
+     * yields that symbol, not the plain name dlsym finds. */
+    {
+        static const int scan_idx[] = {92, 97, 98, 99, 100, 101};
+        int k;
+        for (k = 0; k < 6; k++) {
+            char buf[32];
+            void *p;
+            snprintf(buf, sizeof buf, "__isoc99_%s", filc_ents[scan_idx[k]].name);
+            p = dlsym(RTLD_DEFAULT, buf);
+            if (p)
+                filc_ents[scan_idx[k]].real = p;
+        }
+    }
 }
 
 /* ---- conservative heap GC ------------------------------------------- */

@@ -1,18 +1,56 @@
 # Restoring the Fil-C snapshot
 
-This checkout is a colocated Jujutsu and Git repository. There are two
-restore points. `filc-restore-2` is the later one. `filc-restore` is
-the earlier one and stays at change `knsozxvl`. Look a bookmark up
-rather than trusting a Git hash copied from somewhere else:
+This checkout is a colocated Jujutsu and Git repository. There are three
+restore points. `filc-restore-3` is the later one. `filc-restore-2`
+stays at change `wqqtzoou`. `filc-restore` stays at change `knsozxvl`.
+Look a bookmark up rather than trusting a Git hash copied from somewhere
+else:
 
 ```
-jj log -r 'filc-restore-2 | filc-restore'
+jj log -r 'filc-restore-3 | filc-restore-2 | filc-restore'
 ```
 
 `mob` stays on the upstream commit. In Git each bookmark is a branch of
 the same name.
 
-## Later restore point
+## Latest restore point
+
+`filc-restore-3` is change `wrsxwzzo`, the child of `filc-restore-2`.
+Do not move it. Do not edit that change in place.
+
+It adds, on top of the second snapshot:
+
+- `getcwd` checks a caller buffer for a writable `size` bytes and keeps
+  that object's capability. A null buffer is the glibc extension: the
+  result is a filc heap object, and the libc buffer is freed.
+- `sscanf`, `fscanf`, `scanf`, `vsscanf`, `vfscanf`, and `vscanf` check
+  each storing conversion. `va_start` binds the register save area to
+  the variadic frame, so a wrapper can pass the `va_list` on.
+  Unbounded `%s`, scansets, `%p`, `%m`, wide, and positional conversions
+  panic with "unchecked sscanf".
+- `va_list.c` is part of `libtcc1-filc.a` and is compiled with `-filc`.
+  Aligning the overflow cursor keeps the capability. Plain `libtcc1.a`
+  stays uninstrumented. This snapshot did not rebuild that archive.
+- `dlopen`, `dlsym`, `dlclose`, and `dlerror` check strings and handles.
+  A handle is a zero-size capability. A function from `dlsym` can be
+  called and cannot be read. Data is limited to the symbol size.
+- `vprintf`, `vfprintf`, `vsprintf`, `vsnprintf`, and indirect
+  `printf`, `fprintf`, `sprintf`, `snprintf`, and `dprintf` check `%s`
+  and `%n`. A positional `%N$` conversion stops after the format
+  string. A dynamic `.*` precision still requires a terminator.
+
+On 2026-10-27 the Fil-TCC suite was 188/188. The three-stage self-host
+and `make test` were not re-run for this snapshot. The self-host that
+exited 42 is the one recorded on `filc-restore-2`. System libc was not
+rebuilt. `-filc` is not full Fil-C.
+
+Start new work from this snapshot with:
+
+```
+jj new filc-restore-3
+```
+
+## Second restore point
 
 `filc-restore-2` is change `wqqtzoou`, the child of `filc-restore`.
 Do not move it. Do not edit that change in place.
@@ -42,12 +80,6 @@ last binary compiled a program with `-filc` that exited 42, and it
 compiled `lib/filc_rt.c` without `-filc`. The Fil-TCC suite was 152/152
 and `make test` passed. Those two runs used the gcc-built `./tcc`.
 `-filc` is not full Fil-C. System libc was not rebuilt.
-
-Start new work from this snapshot with:
-
-```
-jj new filc-restore-2
-```
 
 ## First restore point
 
@@ -86,14 +118,15 @@ On 2026-10-24 this snapshot had completed the self-host:
 ## See it
 
 ```
-jj log -r 'filc-restore-2 | filc-restore'
-jj show filc-restore-2
+jj log -r 'filc-restore-3 | filc-restore-2 | filc-restore'
+jj show filc-restore-3
+jj bookmark list filc-restore-3
 jj bookmark list filc-restore-2
 jj bookmark list filc-restore
 ```
 
-`filc-restore-2` should stay change `wqqtzoou`. `filc-restore` should
-stay change `knsozxvl`.
+`filc-restore-3` should stay change `wrsxwzzo`. `filc-restore-2` should
+stay change `wqqtzoou`. `filc-restore` should stay change `knsozxvl`.
 
 ## Return the working copy to it
 
@@ -133,20 +166,22 @@ jj new filc-restore
 
 ## Keep the bookmark put
 
-These commands retarget bookmarks. Do not aim them at `filc-restore`
-or `filc-restore-2` unless you mean to replace that snapshot:
+These commands retarget bookmarks. Do not aim them at `filc-restore`,
+`filc-restore-2`, or `filc-restore-3` unless you mean to replace that
+snapshot:
 
 ```
 jj bookmark set
 jj bookmark move
 ```
 
-`jj commit` does not move `filc-restore` or `filc-restore-2`. After any
-restore, check:
+`jj commit` does not move `filc-restore`, `filc-restore-2`, or
+`filc-restore-3`. After any restore, check:
 
 ```
 jj bookmark list filc-restore
 jj bookmark list filc-restore-2
+jj bookmark list filc-restore-3
 ```
 
 ## Undo a jj command
@@ -185,7 +220,8 @@ copy out from under jj.
 
 Git HEAD is detached. That is normal here. jj moves HEAD with the
 working copy and does not slide the `mob` branch forward. `mob` stays
-at `origin/mob`. The branch `filc-restore` is the snapshot.
+at `origin/mob`. The branches `filc-restore`, `filc-restore-2`, and
+`filc-restore-3` are the snapshots.
 
 `mob` tracks `mob@origin`. Fetch with `jj git fetch`. Nothing in this
-setup has been pushed. Pushing `filc-restore` is a separate decision.
+setup has been pushed. Pushing a restore bookmark is a separate decision.

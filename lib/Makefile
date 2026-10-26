@@ -82,11 +82,11 @@ ALL = $(addprefix $(TOP)/,$(X)libtcc1.a $(OBJ-extra))
 # Checked helpers for -filc links. Assembly stays in the plain objects.
 ifeq ($(X),)
 ALL += $(TOP)/libtcc1-filc.a
-# va_list.c stays uninstrumented. __va_arg walks a compiler-built
-# va_list whose interior pointers are not capabilities yet.
-FILC1_C = libtcc1.c stdatomic.c builtin.c dsohandle.c tcov.c
+# Assembly cannot be checked by passing -filc. va_list.c can: filc_va_start
+# publishes reg_save_area and the overflow cursor before __va_arg runs.
+FILC1_C = libtcc1.c stdatomic.c builtin.c dsohandle.c tcov.c va_list.c
 FILC1_O = $(FILC1_C:.c=-filc.o)
-FILC1_ASM = va_list.o alloca.o atomic.o alloca-bt.o
+FILC1_ASM = alloca.o atomic.o alloca-bt.o
 endif
 
 all: $(ALL)

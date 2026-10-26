@@ -55,9 +55,20 @@ void *__va_arg(__builtin_va_list ap,
 
     case __va_stack:
     use_overflow_area:
-        ap->overflow_arg_area += size;
-        ap->overflow_arg_area = (char*)((long long)(ap->overflow_arg_area + align - 1) & -align);
-        return ap->overflow_arg_area - size;
+        {
+            /* Same integer result as aligning through a cast. The delta
+             * is computed as an integer so a capability on the cursor
+             * survives the store. */
+            char *p;
+            unsigned long u, a;
+            p = ap->overflow_arg_area + size;
+            a = (unsigned long)align;
+            u = (unsigned long)p;
+            u = (u + a - 1) & -a;
+            p += u - (unsigned long)p;
+            ap->overflow_arg_area = p;
+            return p - size;
+        }
 
     default: /* should never happen */
         abort();
