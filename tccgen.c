@@ -2358,12 +2358,12 @@ static void filc_emit_vprint(int ap_i)
 /* Check the format, then the caller rebuilds the real call.
  * A v* call checks %s and %n through the va_list instead of
  * recording each argument. */
-static void filc_emit_fmt(int fmt_i, int var_i, int nb, int is_v)
+static void filc_emit_fmt(int fmt_i, int var_i, int nb, int is_v, int wide)
 {
     int i;
     filc_push_caparg(fmt_i);
     filc_push_ival(fmt_i);
-    filc_finish_intercept(TOK_filc_fmt_begin, 2);
+    filc_finish_intercept(wide ? TOK_filc_wfmt_begin : TOK_filc_fmt_begin, 2);
     gfunc_call(2);
     if (is_v) {
         filc_emit_vprint(nb - 1);
@@ -2513,6 +2513,23 @@ static int filc_try_strto(const char *name, int *pnb)
             tok = TOK_filc_strtoul;
         else if (!strcmp(name, "strtoull"))
             tok = TOK_filc_strtoull;
+        else if (!strcmp(name, "wcstol"))
+            tok = TOK_filc_wcstol;
+        else if (!strcmp(name, "wcstoll"))
+            tok = TOK_filc_wcstoll;
+        else if (!strcmp(name, "wcstoul"))
+            tok = TOK_filc_wcstoul;
+        else if (!strcmp(name, "wcstoull"))
+            tok = TOK_filc_wcstoull;
+        /* strtoimax is not strtol. wcstoimax is not wcstol. */
+        else if (!strcmp(name, "strtoimax"))
+            tok = TOK_filc_strtoimax;
+        else if (!strcmp(name, "strtoumax"))
+            tok = TOK_filc_strtoumax;
+        else if (!strcmp(name, "wcstoimax"))
+            tok = TOK_filc_wcstoimax;
+        else if (!strcmp(name, "wcstoumax"))
+            tok = TOK_filc_wcstoumax;
         if (!tok)
             return 0;
         filc_spill_call(nb);
@@ -2532,6 +2549,12 @@ static int filc_try_strto(const char *name, int *pnb)
             tok = TOK_filc_strtod;
         else if (!strcmp(name, "strtold"))
             tok = TOK_filc_strtold;
+        else if (!strcmp(name, "wcstof"))
+            tok = TOK_filc_wcstof;
+        else if (!strcmp(name, "wcstod"))
+            tok = TOK_filc_wcstod;
+        else if (!strcmp(name, "wcstold"))
+            tok = TOK_filc_wcstold;
         if (!tok)
             return 0;
         filc_spill_call(nb);
@@ -2599,19 +2622,21 @@ static int filc_try_sort(const char *name, int *pnb)
     return 0;
 }
 
-/* Source index -1 means there is no source string (fscanf, scanf). */
-static void filc_emit_scan(int src_i, int fmt_i, int dest0, int nb)
+/* Source index -1 means there is no source string (fscanf, scanf).
+ * wide selects a wchar source and a wchar format. The format is
+ * narrowed inside filc_wfmt_begin; the scan walk is unchanged. */
+static void filc_emit_scan(int src_i, int fmt_i, int dest0, int nb, int wide)
 {
     int i;
     if (src_i >= 0) {
         filc_push_caparg(src_i);
         filc_push_ival(src_i);
-        filc_finish_intercept(TOK_filc_strlen, 2);
+        filc_finish_intercept(wide ? TOK_filc_wcslen : TOK_filc_strlen, 2);
         gfunc_call(2);
     }
     filc_push_caparg(fmt_i);
     filc_push_ival(fmt_i);
-    filc_finish_intercept(TOK_filc_fmt_begin, 2);
+    filc_finish_intercept(wide ? TOK_filc_wfmt_begin : TOK_filc_fmt_begin, 2);
     gfunc_call(2);
     for (i = dest0; i < nb; i++) {
         if (filc_is_ptr_arg(filc_sv[i].type.t)) {
@@ -2638,11 +2663,11 @@ static void filc_emit_vscan(int ap_i)
 }
 
 /* printf family, stdio passthroughs, and mmap. Returns 1 if rewritten.
- * Direct printf/fprintf/dprintf keep the libc symbol after the checks.
+ * Direct printf/fprintf/dprintf/vdprintf keep the libc symbol after the checks.
  * *sprintf goes to filc_* so the destination size is enforced. */
 static int filc_try_stdio(const char *name, int *pnb, Sym *sym)
 {
-    int nb, fmt_i, var0, is_v, tok, has_sz, sz, i;
+    int nb, fmt_i, var0, is_v, tok, has_sz, sz, wide, i;
     nb = *pnb;
     if (!strcmp(name, "fclose") && nb == 1)
         return filc_passthru(TOK_filc_fclose, nb, pnb);
@@ -2652,10 +2677,124 @@ static int filc_try_stdio(const char *name, int *pnb, Sym *sym)
         return filc_passthru(TOK_filc_close, nb, pnb);
     if (!strcmp(name, "lseek") && nb == 3)
         return filc_passthru(TOK_filc_lseek, nb, pnb);
+    /* fputwc[4] == 'w'; fputc[4] == 'c'. putwc[3] == 'w'. */
+    if ((!strcmp(name, "fputwc") || !strcmp(name, "putwc")) && nb == 2)
+        return filc_passthru(TOK_filc_fputwc, nb, pnb);
+    if (!strcmp(name, "putwchar") && nb == 1)
+        return filc_passthru(TOK_filc_putwchar, nb, pnb);
+    /* ungetwc pushes one wide character. It writes no caller buffer.
+     * ungetc[5] == 'c'; ungetwc[5] == 'w'. */
+    if (!strcmp(name, "ungetwc") && nb == 2)
+        return filc_passthru(TOK_filc_ungetwc, nb, pnb);
+    if (!strcmp(name, "ungetc") && nb == 2)
+        return filc_passthru(TOK_filc_ungetc, nb, pnb);
+    /* feof, ferror, clearerr, and fileno touch no caller buffer. */
+    if (!strcmp(name, "clearerr") && nb == 1)
+        return filc_passthru(TOK_filc_clearerr, nb, pnb);
+    if (!strcmp(name, "feof") && nb == 1)
+        return filc_passthru(TOK_filc_feof, nb, pnb);
+    if (!strcmp(name, "ferror") && nb == 1)
+        return filc_passthru(TOK_filc_ferror, nb, pnb);
+    if (!strcmp(name, "fileno") && nb == 1)
+        return filc_passthru(TOK_filc_fileno, nb, pnb);
+    /* fseek, ftell, and rewind touch no caller buffer. */
+    if (!strcmp(name, "fseek") && nb == 3)
+        return filc_passthru(TOK_filc_fseek, nb, pnb);
+    if (!strcmp(name, "ftell") && nb == 1)
+        return filc_passthru(TOK_filc_ftell, nb, pnb);
+    if (!strcmp(name, "rewind") && nb == 1)
+        return filc_passthru(TOK_filc_rewind, nb, pnb);
+    /* fseeko and ftello are the off_t forms. They still touch no buffer. */
+    if (!strcmp(name, "fseeko") && nb == 3)
+        return filc_passthru(TOK_filc_fseeko, nb, pnb);
+    if (!strcmp(name, "ftello") && nb == 1)
+        return filc_passthru(TOK_filc_ftello, nb, pnb);
+    /* A null buffer is the system buffer. Otherwise setvbuf writes size
+     * bytes and setbuf writes BUFSIZ. Pointer 0 is the FILE*. */
+    if (!strcmp(name, "setvbuf") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_setvbuf, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "setbuf") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_setbuf, 3);
+        *pnb = 3;
+        return 1;
+    }
+    /* fgetpos writes one fpos_t. fsetpos reads one. */
+    if (!strcmp(name, "fgetpos") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_fgetpos, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "fsetpos") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_fsetpos, 3);
+        *pnb = 3;
+        return 1;
+    }
     if ((!strcmp(name, "fputc") || !strcmp(name, "putc")) && nb == 2)
         return filc_passthru(TOK_filc_fputc, nb, pnb);
     if (!strcmp(name, "putchar") && nb == 1)
         return filc_passthru(TOK_filc_putchar, nb, pnb);
+    /* fgetwc[4] == 'w'; fgetc[4] == 'c'. getwc[3] == 'w'.
+     * None of these write a caller buffer. */
+    if ((!strcmp(name, "fgetwc") || !strcmp(name, "getwc")) && nb == 1)
+        return filc_passthru(TOK_filc_fgetwc, nb, pnb);
+    if (!strcmp(name, "getwchar") && nb == 0)
+        return filc_passthru(TOK_filc_getwchar, nb, pnb);
+    /* fgetc and getc share one helper. Neither writes a caller buffer. */
+    if ((!strcmp(name, "fgetc") || !strcmp(name, "getc")) && nb == 1)
+        return filc_passthru(TOK_filc_fgetc, nb, pnb);
+    if (!strcmp(name, "getchar") && nb == 0)
+        return filc_passthru(TOK_filc_getchar, nb, pnb);
+    /* Unlocked twins. None of these touch a caller buffer.
+     * getc_unlocked shares fgetc_unlocked. putc_unlocked shares
+     * fputc_unlocked. fread_unlocked and fwrite_unlocked do not. */
+    if (!strcmp(name, "fflush_unlocked") && nb == 1)
+        return filc_passthru(TOK_filc_fflush_unlocked, nb, pnb);
+    if ((!strcmp(name, "fgetc_unlocked") || !strcmp(name, "getc_unlocked"))
+        && nb == 1)
+        return filc_passthru(TOK_filc_fgetc_unlocked, nb, pnb);
+    if (!strcmp(name, "getchar_unlocked") && nb == 0)
+        return filc_passthru(TOK_filc_getchar_unlocked, nb, pnb);
+    if ((!strcmp(name, "fputc_unlocked") || !strcmp(name, "putc_unlocked"))
+        && nb == 2)
+        return filc_passthru(TOK_filc_fputc_unlocked, nb, pnb);
+    if (!strcmp(name, "putchar_unlocked") && nb == 1)
+        return filc_passthru(TOK_filc_putchar_unlocked, nb, pnb);
+    if (!strcmp(name, "clearerr_unlocked") && nb == 1)
+        return filc_passthru(TOK_filc_clearerr_unlocked, nb, pnb);
+    if (!strcmp(name, "feof_unlocked") && nb == 1)
+        return filc_passthru(TOK_filc_feof_unlocked, nb, pnb);
+    if (!strcmp(name, "ferror_unlocked") && nb == 1)
+        return filc_passthru(TOK_filc_ferror_unlocked, nb, pnb);
+    if (!strcmp(name, "fileno_unlocked") && nb == 1)
+        return filc_passthru(TOK_filc_fileno_unlocked, nb, pnb);
+    /* Stream locks. No caller buffer. The FILE* stays opaque. */
+    if (!strcmp(name, "flockfile") && nb == 1)
+        return filc_passthru(TOK_filc_flockfile, nb, pnb);
+    if (!strcmp(name, "ftrylockfile") && nb == 1)
+        return filc_passthru(TOK_filc_ftrylockfile, nb, pnb);
+    if (!strcmp(name, "funlockfile") && nb == 1)
+        return filc_passthru(TOK_filc_funlockfile, nb, pnb);
     if (!strcmp(name, "perror") && nb == 1) {
         filc_spill_call(nb);
         filc_push_caparg(0);
@@ -2664,26 +2803,86 @@ static int filc_try_stdio(const char *name, int *pnb, Sym *sym)
         *pnb = 2;
         return 1;
     }
+    /* wscanf is not scanf. Exact names: swscanf is not sscanf,
+     * fwscanf is not fscanf, vswscanf is not vsscanf. */
+    if (!strcmp(name, "swscanf") && nb >= 2 && sym) {
+        filc_spill_call(nb);
+        filc_emit_scan(0, 1, 2, nb, 1);
+        filc_repush(sym, nb);
+        *pnb = nb;
+        return 1;
+    }
+    if (!strcmp(name, "fwscanf") && nb >= 2 && sym) {
+        filc_spill_call(nb);
+        filc_emit_scan(-1, 1, 2, nb, 1);
+        filc_repush(sym, nb);
+        *pnb = nb;
+        return 1;
+    }
+    if (!strcmp(name, "wscanf") && nb >= 1 && sym) {
+        filc_spill_call(nb);
+        filc_emit_scan(-1, 0, 1, nb, 1);
+        filc_repush(sym, nb);
+        *pnb = nb;
+        return 1;
+    }
+    if (!strcmp(name, "vswscanf") && nb == 3 && sym) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_wcslen, 2);
+        gfunc_call(2);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_wfmt_begin, 2);
+        gfunc_call(2);
+        filc_emit_vscan(2);
+        filc_repush(sym, nb);
+        *pnb = nb;
+        return 1;
+    }
+    if (!strcmp(name, "vfwscanf") && nb == 3 && sym) {
+        filc_spill_call(nb);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_wfmt_begin, 2);
+        gfunc_call(2);
+        filc_emit_vscan(2);
+        filc_repush(sym, nb);
+        *pnb = nb;
+        return 1;
+    }
+    if (!strcmp(name, "vwscanf") && nb == 2 && sym) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_wfmt_begin, 2);
+        gfunc_call(2);
+        filc_emit_vscan(1);
+        filc_repush(sym, nb);
+        *pnb = nb;
+        return 1;
+    }
     if (!strcmp(name, "sscanf") && nb >= 2 && sym) {
         /* Source and format must contain a NUL. Each storing conversion
          * then checks its destination. The libc call keeps the original
          * arguments. %s without a width is rejected by filc_scan_end. */
         filc_spill_call(nb);
-        filc_emit_scan(0, 1, 2, nb);
+        filc_emit_scan(0, 1, 2, nb, 0);
         filc_repush(sym, nb);
         *pnb = nb;
         return 1;
     }
     if (!strcmp(name, "fscanf") && nb >= 2 && sym) {
         filc_spill_call(nb);
-        filc_emit_scan(-1, 1, 2, nb);
+        filc_emit_scan(-1, 1, 2, nb, 0);
         filc_repush(sym, nb);
         *pnb = nb;
         return 1;
     }
     if (!strcmp(name, "scanf") && nb >= 1 && sym) {
         filc_spill_call(nb);
-        filc_emit_scan(-1, 0, 1, nb);
+        filc_emit_scan(-1, 0, 1, nb, 0);
         filc_repush(sym, nb);
         *pnb = nb;
         return 1;
@@ -2759,7 +2958,40 @@ static int filc_try_stdio(const char *name, int *pnb, Sym *sym)
     tok = 0;
     has_sz = 0;
     sz = 0;
-    if (!strcmp(name, "printf") && nb >= 1) {
+    wide = 0;
+    /* wprintf is not printf. swprintf[0] == 's'; fwprintf[0] == 'f'. */
+    if (!strcmp(name, "wprintf") && nb >= 1) {
+        fmt_i = 0;
+        var0 = 1;
+        wide = 1;
+    } else if (!strcmp(name, "fwprintf") && nb >= 2) {
+        fmt_i = 1;
+        var0 = 2;
+        wide = 1;
+    } else if (!strcmp(name, "swprintf") && nb >= 3) {
+        fmt_i = 2;
+        var0 = 3;
+        tok = TOK_filc_swprintf;
+        has_sz = 1;
+        sz = 1;
+        wide = 1;
+    } else if (!strcmp(name, "vwprintf") && nb == 2) {
+        fmt_i = 0;
+        is_v = 1;
+        wide = 1;
+    } else if (!strcmp(name, "vfwprintf") && nb == 3) {
+        fmt_i = 1;
+        is_v = 1;
+        wide = 1;
+    } else if (!strcmp(name, "vswprintf") && nb == 4) {
+        fmt_i = 2;
+        var0 = 3;
+        is_v = 1;
+        tok = TOK_filc_vswprintf;
+        has_sz = 1;
+        sz = 1;
+        wide = 1;
+    } else if (!strcmp(name, "printf") && nb >= 1) {
         fmt_i = 0;
         var0 = 1;
     } else if (!strcmp(name, "fprintf") && nb >= 2) {
@@ -2780,6 +3012,10 @@ static int filc_try_stdio(const char *name, int *pnb, Sym *sym)
         sz = 1;
     } else if (!strcmp(name, "vprintf") && nb == 2) {
         fmt_i = 0;
+        is_v = 1;
+    } else if (!strcmp(name, "vdprintf") && nb == 3) {
+        /* Argument 0 is the fd. The format is argument 1. */
+        fmt_i = 1;
         is_v = 1;
     } else if (!strcmp(name, "vfprintf") && nb == 3) {
         fmt_i = 1;
@@ -2802,7 +3038,7 @@ static int filc_try_stdio(const char *name, int *pnb, Sym *sym)
     if (!tok && !sym)
         return 0;
     filc_spill_call(nb);
-    filc_emit_fmt(fmt_i, var0, nb, is_v);
+    filc_emit_fmt(fmt_i, var0, nb, is_v, wide);
     if (tok)
         filc_repush_buf(tok, has_sz, sz, fmt_i, var0, nb, pnb);
     else {
@@ -2867,6 +3103,84 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         filc_ret_mode = FILC_RET_GET;
         return 1;
     }
+    /* mempcpy is not memcpy. The return is dest+n. The capability
+     * stays the destination. mempcpy[3] == 'p'. */
+    if (!strcmp(name, "mempcpy") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_mempcpy, 5);
+        *pnb = 5;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    /* bcmp is memcmp. bcopy is memmove with the source first.
+     * bcmp[2] == 'm'; bcopy[2] == 'o'. Neither returns a pointer. */
+    if ((!strcmp(name, "bcmp") || !strcmp(name, "bcopy")) && nb == 3) {
+        tok = name[2] == 'm' ? TOK_filc_bcmp : TOK_filc_bcopy;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(tok, 5);
+        *pnb = 5;
+        return 1;
+    }
+    /* ffs, ffsl, and ffsll return a bit index. No caller buffer.
+     * ffs[3] == 0. ffsl[4] == 0. ffsll[4] == 'l'. */
+    if ((!strcmp(name, "ffs") || !strcmp(name, "ffsl") || !strcmp(name, "ffsll"))
+        && nb == 1) {
+        if (name[3] == 'l')
+            tok = name[4] == 'l' ? TOK_filc_ffsll : TOK_filc_ffsl;
+        else
+            tok = TOK_filc_ffs;
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_finish_intercept(tok, 1);
+        *pnb = 1;
+        return 1;
+    }
+    /* strerror and strsignal return a libc message. The cover is
+     * read-only. strerror[3] == 'e'. strsignal[3] == 's'. */
+    if ((!strcmp(name, "strerror") || !strcmp(name, "strsignal"))
+        && nb == 1) {
+        tok = name[3] == 's' ? TOK_filc_strsignal : TOK_filc_strerror;
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_finish_intercept(tok, 1);
+        *pnb = 1;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    /* XSI strerror_r returns int. The GNU form returns char * and
+     * stays out. n == 0 does not touch the buffer. */
+    if (!strcmp(name, "strerror_r") && nb == 3 && !ret_ptr) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_strerror_r, 4);
+        *pnb = 4;
+        return 1;
+    }
+    /* strerror_l returns a libc message. The locale is opaque,
+     * including LC_GLOBAL_LOCALE, so only the int and the bits
+     * are passed. The cover is read-only. */
+    if (!strcmp(name, "strerror_l") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_strerror_l, 2);
+        *pnb = 2;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
     if (!strcmp(name, "memset") && nb == 3) {
         filc_spill_call(nb);
         filc_push_caparg(0);
@@ -2886,8 +3200,66 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         *pnb = 2;
         return 1;
     }
+    /* wcschr[3] == 'c'; wcsrchr[3] == 'r'. Exact names, not strchr. */
+    if (!strcmp(name, "wcschr") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_wcschr, 3);
+        *pnb = 3;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "wcsrchr") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_wcsrchr, 3);
+        *pnb = 3;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "wcsstr") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_wcsstr, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
     if ((!strcmp(name, "strchr") || !strcmp(name, "strrchr")) && nb == 2) {
         tok = name[3] == 'r' ? TOK_filc_strrchr : TOK_filc_strchr;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(tok, 3);
+        *pnb = 3;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    /* strchrnul is not strchr. The return is the match, or the
+     * terminating NUL when the character is absent. The capability
+     * stays the source. */
+    if (!strcmp(name, "strchrnul") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_strchrnul, 3);
+        *pnb = 3;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    /* index is strchr. rindex is strrchr. index[0] == 'i';
+     * rindex[0] == 'r'. A hit keeps the source capability. */
+    if ((!strcmp(name, "index") || !strcmp(name, "rindex")) && nb == 2) {
+        tok = name[0] == 'r' ? TOK_filc_rindex : TOK_filc_index;
         filc_spill_call(nb);
         filc_push_caparg(0);
         filc_push_ival(0);
@@ -2922,6 +3294,18 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         *pnb = n == 3 ? 5 : 4;
         return 1;
     }
+    /* wmemchr searches n wchar_t. It is not memchr. */
+    if (!strcmp(name, "wmemchr") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_wmemchr, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
     if (!strcmp(name, "memchr") && nb == 3) {
         filc_spill_call(nb);
         filc_push_caparg(0);
@@ -2931,6 +3315,16 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         filc_finish_intercept(TOK_filc_memchr, 4);
         *pnb = 4;
         filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    /* wcsdup[0] == 'w'. Exact name, not strdup. Fresh heap lower. */
+    if (!strcmp(name, "wcsdup") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_wcsdup, 2);
+        *pnb = 2;
+        filc_ret_mode = FILC_RET_PTR;
         return 1;
     }
     if (!strcmp(name, "strdup") && nb == 1) {
@@ -2969,6 +3363,21 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         filc_ret_mode = FILC_RET_GET;
         return 1;
     }
+    /* strlcpy and strlcat return a length, not a pointer. The source
+     * always needs a terminator. n == 0 does not touch the destination.
+     * strlcpy[5] == 'p'; strlcat[5] == 'a'. Not strncpy. */
+    if ((!strcmp(name, "strlcpy") || !strcmp(name, "strlcat")) && nb == 3) {
+        tok = name[5] == 'p' ? TOK_filc_strlcpy : TOK_filc_strlcat;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(tok, 5);
+        *pnb = 5;
+        return 1;
+    }
     if (!strcmp(name, "strnlen") && nb == 2) {
         filc_spill_call(nb);
         filc_push_caparg(0);
@@ -2976,6 +3385,436 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         filc_push_ival(1);
         filc_finish_intercept(TOK_filc_strnlen, 3);
         *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "wcslen") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_wcslen, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if (!strcmp(name, "wcsnlen") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_wcsnlen, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if ((!strcmp(name, "wcscpy") || !strcmp(name, "wcscat")) && nb == 2) {
+        /* wcscpy[4] == 'p'; wcscat[4] == 'a'. Exact names, not strcpy. */
+        tok = name[4] == 'a' ? TOK_filc_wcscat : TOK_filc_wcscpy;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(tok, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if ((!strcmp(name, "wcsncpy") || !strcmp(name, "wcsncat")) && nb == 3) {
+        /* wcsncpy[5] == 'p'; wcsncat[5] == 'a'. */
+        tok = name[5] == 'p' ? TOK_filc_wcsncpy : TOK_filc_wcsncat;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(tok, 5);
+        *pnb = 5;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    /* wcpcpy is not wcscpy. wcpncpy is not wcsncpy. The return points
+     * at the written wide NUL, or at dest+n when wcpncpy writes none.
+     * The capability stays the destination. */
+    if (!strcmp(name, "wcpcpy") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_wcpcpy, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "wcpncpy") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_wcpncpy, 5);
+        *pnb = 5;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    /* wcslcpy and wcslcat return a length, not a pointer. The source
+     * always needs a terminator. n == 0 does not touch the destination. */
+    if ((!strcmp(name, "wcslcpy") || !strcmp(name, "wcslcat")) && nb == 3) {
+        /* wcslcpy[5] == 'p'; wcslcat[5] == 'a'. */
+        tok = name[5] == 'p' ? TOK_filc_wcslcpy : TOK_filc_wcslcat;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(tok, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if ((!strcmp(name, "wcscmp") && nb == 2) || (!strcmp(name, "wcsncmp") && nb == 3)) {
+        int n = nb;
+        tok = n == 3 ? TOK_filc_wcsncmp : TOK_filc_wcscmp;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        if (n == 3)
+            filc_push_ival(2);
+        filc_finish_intercept(tok, n == 3 ? 5 : 4);
+        *pnb = n == 3 ? 5 : 4;
+        return 1;
+    }
+    if ((!strcmp(name, "mbstowcs") || !strcmp(name, "wcstombs")) && nb == 3) {
+        /* mbstowcs[0] == 'm'; wcstombs[0] == 'w'. */
+        tok = name[0] == 'm' ? TOK_filc_mbstowcs : TOK_filc_wcstombs;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(tok, 5);
+        *pnb = 5;
+        return 1;
+    }
+    /* wmemcpy[5] == 'p' and wmemcmp[5] == 'm'. Exact names, not memcpy. */
+    if (!strcmp(name, "wmemcpy") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_wmemcpy, 5);
+        *pnb = 5;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "wmemmove") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_wmemmove, 5);
+        *pnb = 5;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "wmemset") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_wmemset, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "wmemcmp") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_wmemcmp, 5);
+        *pnb = 5;
+        return 1;
+    }
+    /* mbsnrtowcs[3] == 'n'; mbsrtowcs[3] == 'r'. Same for wcsnrtombs.
+     * The extra count is how many source bytes or wchar_t to examine. */
+    if (!strcmp(name, "mbsnrtowcs") && nb == 5) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_push_caparg(4);
+        filc_push_ival(4);
+        filc_finish_intercept(TOK_filc_mbsnrtowcs, 8);
+        *pnb = 8;
+        return 1;
+    }
+    if (!strcmp(name, "wcsnrtombs") && nb == 5) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_push_caparg(4);
+        filc_push_ival(4);
+        filc_finish_intercept(TOK_filc_wcsnrtombs, 8);
+        *pnb = 8;
+        return 1;
+    }
+    /* wcwidth is one code. wcswidth stops at a wide NUL or at n. */
+    if (!strcmp(name, "wcwidth") && nb == 1)
+        return filc_passthru(TOK_filc_wcwidth, nb, pnb);
+    if (!strcmp(name, "wcswidth") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_wcswidth, 3);
+        *pnb = 3;
+        return 1;
+    }
+    /* wcscoll[4] == 'o'; wcscmp[4] == 'm'. Both strings need a terminator.
+     * wcsxfrm checks n wchar_t only when n is not zero. */
+    if (!strcmp(name, "wcscoll") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_wcscoll, 4);
+        *pnb = 4;
+        return 1;
+    }
+    /* wcscasecmp is not wcscmp. wcsncasecmp is not wcsncmp.
+     * Exact names, so the _l forms stay out. */
+    if (!strcmp(name, "wcscasecmp") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_wcscasecmp, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "wcsncasecmp") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_wcsncasecmp, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "wcsxfrm") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_wcsxfrm, 5);
+        *pnb = 5;
+        return 1;
+    }
+    /* strcoll and strxfrm are the byte forms of wcscoll and wcsxfrm. */
+    if (!strcmp(name, "strcoll") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_strcoll, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "strxfrm") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_strxfrm, 5);
+        *pnb = 5;
+        return 1;
+    }
+    /* btowc and wctob pass one character code. Neither touches a buffer. */
+    if (!strcmp(name, "btowc") && nb == 1)
+        return filc_passthru(TOK_filc_btowc, nb, pnb);
+    if (!strcmp(name, "wctob") && nb == 1)
+        return filc_passthru(TOK_filc_wctob, nb, pnb);
+    /* One code each. Exact names, so the _l forms stay out. */
+    if (!strcmp(name, "towlower") && nb == 1)
+        return filc_passthru(TOK_filc_towlower, nb, pnb);
+    if (!strcmp(name, "towupper") && nb == 1)
+        return filc_passthru(TOK_filc_towupper, nb, pnb);
+    /* One wide character class. Exact names, so the _l forms stay out. */
+    if (!strcmp(name, "iswalnum") && nb == 1)
+        return filc_passthru(TOK_filc_iswalnum, nb, pnb);
+    if (!strcmp(name, "iswalpha") && nb == 1)
+        return filc_passthru(TOK_filc_iswalpha, nb, pnb);
+    if (!strcmp(name, "iswcntrl") && nb == 1)
+        return filc_passthru(TOK_filc_iswcntrl, nb, pnb);
+    if (!strcmp(name, "iswdigit") && nb == 1)
+        return filc_passthru(TOK_filc_iswdigit, nb, pnb);
+    if (!strcmp(name, "iswgraph") && nb == 1)
+        return filc_passthru(TOK_filc_iswgraph, nb, pnb);
+    if (!strcmp(name, "iswlower") && nb == 1)
+        return filc_passthru(TOK_filc_iswlower, nb, pnb);
+    if (!strcmp(name, "iswprint") && nb == 1)
+        return filc_passthru(TOK_filc_iswprint, nb, pnb);
+    if (!strcmp(name, "iswpunct") && nb == 1)
+        return filc_passthru(TOK_filc_iswpunct, nb, pnb);
+    if (!strcmp(name, "iswspace") && nb == 1)
+        return filc_passthru(TOK_filc_iswspace, nb, pnb);
+    if (!strcmp(name, "iswupper") && nb == 1)
+        return filc_passthru(TOK_filc_iswupper, nb, pnb);
+    if (!strcmp(name, "iswxdigit") && nb == 1)
+        return filc_passthru(TOK_filc_iswxdigit, nb, pnb);
+    if (!strcmp(name, "iswblank") && nb == 1)
+        return filc_passthru(TOK_filc_iswblank, nb, pnb);
+    /* wctype and wctrans read one property name. The descriptor is
+     * opaque: wctype_t is an integer, and wctrans_t points into libc.
+     * Exact names, so the _l forms stay out. */
+    if (!strcmp(name, "wctype") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_wctype, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if (!strcmp(name, "iswctype") && nb == 2)
+        return filc_passthru(TOK_filc_iswctype, nb, pnb);
+    if (!strcmp(name, "wctrans") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_wctrans, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if (!strcmp(name, "towctrans") && nb == 2)
+        return filc_passthru(TOK_filc_towctrans, nb, pnb);
+    /* mbrtowc[2] == 'r'; mbsrtowcs[2] == 's'. A null source is the reset. */
+    if (!strcmp(name, "mbrtowc") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_caparg(3);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_mbrtowc, 7);
+        *pnb = 7;
+        return 1;
+    }
+    /* wcrtomb[2] == 'r'; wcsrtombs[2] == 's'. A null destination is the reset. */
+    if (!strcmp(name, "wcrtomb") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_wcrtomb, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "mbrlen") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_mbrlen, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "mbsinit") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_mbsinit, 2);
+        *pnb = 2;
+        return 1;
+    }
+    /* mblen[2] == 'l'. mbtowc[2] == 't'; mbstowcs[2] == 's'.
+     * wctomb[2] == 't'; wcstombs[2] == 's'. A null pointer is the reset. */
+    if (!strcmp(name, "mblen") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_mblen, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "mbtowc") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_mbtowc, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "wctomb") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_wctomb, 3);
+        *pnb = 3;
+        return 1;
+    }
+    /* mbsrtowcs[3] == 'r'; mbstowcs[3] == 't'. Same for wcsrtombs. */
+    if (!strcmp(name, "mbsrtowcs") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_caparg(3);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_mbsrtowcs, 7);
+        *pnb = 7;
+        return 1;
+    }
+    if (!strcmp(name, "wcsrtombs") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_caparg(3);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_wcsrtombs, 7);
+        *pnb = 7;
         return 1;
     }
     if (!strcmp(name, "memcmp") && nb == 3) {
@@ -3022,6 +3861,29 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         filc_ret_mode = FILC_RET_GET;
         return 1;
     }
+    /* wcsspn[3] == 's'; wcscspn[3] == 'c'. Exact names, not strspn. */
+    if ((!strcmp(name, "wcsspn") || !strcmp(name, "wcscspn")) && nb == 2) {
+        tok = name[3] == 'c' ? TOK_filc_wcscspn : TOK_filc_wcsspn;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(tok, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "wcspbrk") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_wcspbrk, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
     if ((!strcmp(name, "strspn") || !strcmp(name, "strcspn")) && nb == 2) {
         /* strspn[3] == 's'; strcspn[3] == 'c'. */
         tok = name[3] == 'c' ? TOK_filc_strcspn : TOK_filc_strspn;
@@ -3065,6 +3927,20 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         filc_push_ival(1);
         filc_finish_intercept(TOK_filc_explicit_bzero, 3);
         *pnb = 3;
+        return 1;
+    }
+    /* wcstok is the wide strtok_r: string, delim, save pointer. */
+    if (!strcmp(name, "wcstok") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_wcstok, 6);
+        *pnb = 6;
+        filc_ret_mode = FILC_RET_GET;
         return 1;
     }
     if (!strcmp(name, "strtok") && nb == 2) {
@@ -3140,6 +4016,32 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         *pnb = 5;
         return 1;
     }
+    if ((!strcmp(name, "fread_unlocked") || !strcmp(name, "fwrite_unlocked"))
+        && nb == 4) {
+        /* Same buffer check as fread and fwrite. The FILE* stays opaque. */
+        tok = name[1] == 'w' ? TOK_filc_fwrite_unlocked : TOK_filc_fread_unlocked;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(tok, 5);
+        *pnb = 5;
+        return 1;
+    }
+    /* fgetws[4] == 'w' and fgets[4] == 's'. n counts wchar_t. */
+    if (!strcmp(name, "fgetws") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_fgetws, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
     if (!strcmp(name, "fgets") && nb == 3) {
         /* The returned pointer may be interior, so the cap is the buffer. */
         filc_spill_call(nb);
@@ -3150,6 +4052,31 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         filc_finish_intercept(TOK_filc_fgets, 4);
         *pnb = 4;
         filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "getline") && nb == 3) {
+        /* lineptr and n are writable slots. The FILE* stays opaque.
+         * The return is a length, not the buffer. */
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_getline, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "getdelim") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_getdelim, 6);
+        *pnb = 6;
         return 1;
     }
     if ((!strcmp(name, "getenv") || !strcmp(name, "secure_getenv")) && nb == 1) {
@@ -3236,6 +4163,25 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         *pnb = 3;
         return 1;
     }
+    /* remove and rename read path strings. They write no caller buffer. */
+    if (!strcmp(name, "remove") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_remove, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if (!strcmp(name, "rename") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_rename, 4);
+        *pnb = 4;
+        return 1;
+    }
     if (!strcmp(name, "getcwd") && nb == 2) {
         /* The return is the caller's buffer, so it keeps that object's
          * capability. A null buffer is handled in the runtime. */
@@ -3246,6 +4192,51 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         filc_finish_intercept(TOK_filc_getcwd, 3);
         *pnb = 3;
         filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "dlmopen") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_dlmopen, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "dlvsym") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_dlvsym, 6);
+        *pnb = 6;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "dladdr1") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_dladdr1, 6);
+        *pnb = 6;
+        return 1;
+    }
+    if (!strcmp(name, "dladdr") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_dladdr, 3);
+        *pnb = 3;
         return 1;
     }
     if (!strcmp(name, "dlopen") && nb == 2) {
@@ -3290,6 +4281,16 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         filc_push_ival(0);
         filc_finish_intercept(TOK_filc_puts, 2);
         *pnb = 2;
+        return 1;
+    }
+    /* fputws[4] == 'w'; fputs[4] == 's'. The string is wide. */
+    if (!strcmp(name, "fputws") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_fputws, 3);
+        *pnb = 3;
         return 1;
     }
     if (!strcmp(name, "fputs") && nb == 2) {

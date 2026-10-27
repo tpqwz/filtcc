@@ -174,7 +174,7 @@ static const char version[] =
 #ifdef TCC_GITHASH
     " "TCC_GITHASH
 #endif
-    " ("
+    " fil-tcc " FILTCC_VERSION " ("
 #ifdef TCC_TARGET_I386
         "i386"
 #elif defined TCC_TARGET_X86_64
@@ -209,6 +209,58 @@ static const char version[] =
 #endif
     ")\n"
     ;
+
+/* Titles (no leading space) are bold. On an indented line, each leading
+   word that starts with '-' or '@' is bold cyan; the description stays plain. */
+static void tcc_puts_help(const char *text)
+{
+    const char *p;
+
+    if (!tcc_color_fd(fileno(stdout))) {
+        fputs(text, stdout);
+        return;
+    }
+    for (p = text; *p; ) {
+        const char *nl = strchr(p, '\n');
+        const char *end = nl ? nl : strchr(p, '\0');
+
+        if (*p != ' ' && *p != '\t') {
+            fputs("\033[1m", stdout);
+            fwrite(p, 1, (size_t)(end - p), stdout);
+            fputs("\033[0m", stdout);
+        } else {
+            const char *q = p;
+
+            while (q < end && (*q == ' ' || *q == '\t'))
+                q++;
+            fwrite(p, 1, (size_t)(q - p), stdout);
+            while (q < end && (*q == '-' || *q == '@')) {
+                const char *w = q;
+                const char *n;
+
+                while (w < end && *w != ' ' && *w != '\t')
+                    w++;
+                fputs("\033[1;36m", stdout);
+                fwrite(q, 1, (size_t)(w - q), stdout);
+                fputs("\033[0m", stdout);
+                q = w;
+                n = q;
+                while (n < end && (*n == ' ' || *n == '\t'))
+                    n++;
+                if (n >= end || (*n != '-' && *n != '@'))
+                    break;
+                fwrite(q, 1, (size_t)(n - q), stdout);
+                q = n;
+            }
+            if (q < end)
+                fwrite(q, 1, (size_t)(end - q), stdout);
+        }
+        if (!nl)
+            break;
+        fputc('\n', stdout);
+        p = nl + 1;
+    }
+}
 
 static void print_dirs(const char *msg, char **paths, int nb_paths)
 {
@@ -305,15 +357,15 @@ redo:
     if (n == 0) {
         ret = 0;
         if (opt == OPT_HELP) {
-            fputs(help, stdout);
+            tcc_puts_help(help);
             if (s->verbose)
                 goto help2;
         } else if (opt == OPT_HELP2) {
-            help2: fputs(help2, stdout);
+            help2: tcc_puts_help(help2);
         } else if (opt == OPT_M32 || opt == OPT_M64) {
             ret = tcc_tool_cross(argv, opt);
         } else if (s->verbose)
-            printf("%s", version);
+            tcc_puts_help(version);
 
         if (opt == OPT_AR)
             ret = tcc_tool_ar(argc, argv);

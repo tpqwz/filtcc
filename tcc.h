@@ -21,6 +21,10 @@
 #ifndef _TCC_H
 #define _TCC_H
 
+/* Fil-TCC release. TCC_VERSION stays the TinyCC base (0.9.28rc).
+ * tcc -dumpversion prints only that base. tcc -v also prints this. */
+#define FILTCC_VERSION "0.1.0"
+
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
 #include "config.h"
@@ -1279,6 +1283,8 @@ ST_FUNC void cstr_reset(CString *cstr);
 ST_FUNC void tcc_open_bf(TCCState *s1, const char *filename, int initlen);
 ST_FUNC int tcc_open(TCCState *s1, const char *filename);
 ST_FUNC void tcc_close(void);
+/* 1 when fd should get ANSI color: a tty, NO_COLOR unset or empty, TERM not "dumb". */
+ST_FUNC int tcc_color_fd(int fd);
 
 /* mark a memory pointer on stack for cleanup after errors */
 #define stk_push(p) dynarray_add(&stk_data, &nb_stk_data, p)

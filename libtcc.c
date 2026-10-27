@@ -625,12 +625,34 @@ static void tcc_split_path(TCCState *s, void *p_ary, int *p_nb_ary, const char *
 /* error1() modes */
 enum { ERROR_WARN, ERROR_NOABORT, ERROR_ERROR };
 
+/* mob_nsauzede/colored_warning_error: bold white locus, bold magenta
+   "warning:", bold red "error:". Help uses the same tty gate. */
+ST_FUNC int tcc_color_fd(int fd)
+{
+    const char *e;
+
+    if (!isatty(fd))
+        return 0;
+    e = getenv("NO_COLOR");
+    if (e && *e)
+        return 0;
+    e = getenv("TERM");
+    if (e && strcmp(e, "dumb") == 0)
+        return 0;
+#ifdef _WIN32
+    /* VT processing is not enabled on the Windows console. */
+    return 0;
+#endif
+    return 1;
+}
+
 static void error1(int mode, const char *fmt, va_list ap)
 {
     BufferedFile **pf, *f;
     TCCState *s1 = tcc_state;
     CString cs;
     int line = 0;
+    const char *bred = "", *bwhite = "", *bmagenta = "", *normal = "";
 
     tcc_exit_state(s1);
 
@@ -652,6 +674,13 @@ static void error1(int mode, const char *fmt, va_list ap)
             return;
     }
 
+    if (tcc_color_fd(2)) {
+        bred = "\033[1;31m";
+        bwhite = "\033[1;37m";
+        bmagenta = "\033[1;35m";
+        normal = "\033[0m";
+    }
+
     cstr_new(&cs);
     if (fmt[0] == '%' && fmt[1] == 'i' && fmt[2] == ':')
         line = va_arg(ap, int), fmt += 3;
@@ -663,17 +692,20 @@ static void error1(int mode, const char *fmt, va_list ap)
     }
     if (f) {
         for(pf = s1->include_stack; pf < s1->include_stack_ptr; pf++)
-            cstr_printf(&cs, "In file included from %s:%d:\n",
-                (*pf)->filename, (*pf)->line_num - 1);
+            cstr_printf(&cs, "%sIn file included from %s:%d:%s\n",
+                bwhite, (*pf)->filename, (*pf)->line_num - 1, normal);
         if (0 == line)
             line = f->line_num - ((tok_flags & TOK_FLAG_BOL) && !macro_ptr);
-        cstr_printf(&cs, "%s:%d: ", f->filename, line);
+        cstr_printf(&cs, "%s%s:%d:%s ", bwhite, f->filename, line, normal);
     } else if (s1->current_filename) {
-        cstr_printf(&cs, "%s: ", s1->current_filename);
+        cstr_printf(&cs, "%s%s:%s ", bwhite, s1->current_filename, normal);
     } else {
-        cstr_printf(&cs, "tcc: ");
+        cstr_printf(&cs, "%stcc:%s ", bwhite, normal);
     }
-    cstr_printf(&cs, mode == ERROR_WARN ? "warning: " : "error: ");
+    cstr_printf(&cs, "%s%s%s",
+        mode == ERROR_WARN ? bmagenta : bred,
+        mode == ERROR_WARN ? "warning: " : "error: ",
+        normal);
     if (pp_expr > 1)
         pp_error(&cs); /* special handler for preprocessor expression errors */
     else
