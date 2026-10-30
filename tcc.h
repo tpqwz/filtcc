@@ -1284,7 +1284,8 @@ ST_FUNC void tcc_open_bf(TCCState *s1, const char *filename, int initlen);
 ST_FUNC int tcc_open(TCCState *s1, const char *filename);
 ST_FUNC void tcc_close(void);
 /* 1 when fd should get ANSI color: a tty, NO_COLOR unset or empty, TERM not "dumb". */
-ST_FUNC int tcc_color_fd(int fd);
+/* Used by tcc.c when ONE_SOURCE is 0, so this must be exported from libtcc. */
+PUB_FUNC int tcc_color_fd(int fd);
 
 /* mark a memory pointer on stack for cleanup after errors */
 #define stk_push(p) dynarray_add(&stk_data, &nb_stk_data, p)

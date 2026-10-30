@@ -627,7 +627,7 @@ enum { ERROR_WARN, ERROR_NOABORT, ERROR_ERROR };
 
 /* mob_nsauzede/colored_warning_error: bold white locus, bold magenta
    "warning:", bold red "error:". Help uses the same tty gate. */
-ST_FUNC int tcc_color_fd(int fd)
+PUB_FUNC int tcc_color_fd(int fd)
 {
     const char *e;
 
