@@ -50,7 +50,12 @@ Nat = $(if $X,no,)
 Cbt = $(Nat)$(subst yes,,$(CONFIG_backtrace))
 Cbc = $(Cbt)$(subst yes,,$(CONFIG_bcheck))
 
-$(Nat)COMMON_O += runmain.o tcov.o filc_rt.o
+$(Nat)COMMON_O += runmain.o tcov.o
+# -filc runtime is x86_64 System V Linux. T is x86_64 there. macOS is
+# x86_64-osx and Windows is x86_64-win32, so those builds stay plain.
+ifeq ($(X)$(T),x86_64)
+COMMON_O += filc_rt.o
+endif
 $(Cbt)COMMON_O += bt-exe.o bt-log.o
 $(Cbt)WIN_O += bt-dll.o
 $(Cbc)COMMON_O += bcheck.o bcheck_run.o
@@ -80,7 +85,7 @@ OBJ-libtcc1 = $(addprefix $(X),$(filter-out $(OBJ-extra),$(OBJ-$T)))
 
 ALL = $(addprefix $(TOP)/,$(X)libtcc1.a $(OBJ-extra))
 # Checked helpers for -filc links. Assembly stays in the plain objects.
-ifeq ($(X),)
+ifeq ($(X)$(T),x86_64)
 ALL += $(TOP)/libtcc1-filc.a
 # Assembly cannot be checked by passing -filc. va_list.c can: filc_va_start
 # publishes reg_save_area and the overflow cursor before __va_arg runs.
@@ -94,7 +99,7 @@ all: $(ALL)
 $(TOP)/$(X)libtcc1.a : $(OBJ-libtcc1) $(TCC)
 	$S$(XAR) rcs $@ $(OBJ-libtcc1)
 
-ifeq ($(X),)
+ifeq ($(X)$(T),x86_64)
 $(TOP)/libtcc1-filc.a : $(FILC1_O) $(FILC1_ASM) $(TCC)
 	$S$(XAR) rcs $@ $(FILC1_O) $(FILC1_ASM)
 
