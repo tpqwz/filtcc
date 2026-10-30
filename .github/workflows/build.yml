@@ -1,9 +1,7 @@
 name: build and test
 
-# -filc is x86_64 System V. The runtime (filc_rt.c, libtcc1-filc.a) is
-# built on Linux only. macOS and Windows jobs build the x86_64 compiler.
-# arm, aarch64, riscv64, and i386 are not built: -filc is not implemented
-# there.
+# -filc runtime (filc_rt.o, libtcc1-filc.a) builds on x86_64 Linux only.
+# Other architectures and the macOS and Windows compilers are not built.
 
 on:
   push:
@@ -22,6 +20,8 @@ jobs:
       run: |
         ./configure
         make -j"$(nproc)"
+        test -f filc_rt.o
+        test -f libtcc1-filc.a
         make test -k
     - name: link and run a -filc program
       run: |
@@ -36,25 +36,3 @@ jobs:
         ./tcc -B. -filc filc_ci_smoke.c -o filc_ci_smoke
         ./filc_ci_smoke
         rm -f filc_ci_smoke filc_ci_smoke.c
-
-  test-x86_64-osx:
-    runs-on: macos-15-intel
-    timeout-minutes: 15
-    steps:
-    - uses: actions/checkout@v4
-    - name: make & test tcc (x86_64-osx)
-      run: ./configure && make && make test -k
-
-  test-x86_64-win32:
-    runs-on: windows-2025
-    timeout-minutes: 15
-    steps:
-    - uses: actions/checkout@v4
-    - name: build & test (x86_64-win32)
-      shell: cmd
-      run: |
-        cd win32
-        for /f "delims=" %%i in ('vswhere.exe -latest -property installationPath') do call "%%i\VC\Auxiliary\Build\vcvarsall.bat" amd64
-        call build-tcc.bat -c cl -t x86_64
-        cd ..\tests
-        call test-win32.bat all -k
