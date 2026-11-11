@@ -2262,6 +2262,50 @@ static void filc_func_leave(void)
     filc_mark_slot = 0;
 }
 
+/* Sockets, directories, and fork reach glibc with no buffer check.
+ * Threads are not in this list. */
+static int filc_is_unchecked(const char *name)
+{
+    static const char *const names[] = {
+        "fork", "vfork",
+        "socket", "socketpair", "bind", "listen", "accept", "accept4",
+        "connect", "send", "sendto", "sendmsg", "recv", "recvfrom", "recvmsg",
+        "opendir", "fdopendir", "readdir", "readdir_r", "closedir",
+        "seekdir", "telldir", "rewinddir", "scandir",
+        NULL
+    };
+    int i;
+    if (!name)
+        return 0;
+    for (i = 0; names[i]; i++)
+        if (!strcmp(name, names[i]))
+            return 1;
+    return 0;
+}
+
+static void filc_spill_call(int nb);
+
+static void filc_emit_unchecked(const char *name, int nb)
+{
+    CType ty;
+    Section *sec;
+    int len;
+    unsigned long off;
+    char *p;
+
+    filc_spill_call(nb);
+    len = (int)strlen(name) + 1;
+    sec = rodata_section;
+    off = sec->data_offset;
+    p = section_ptr_add(sec, len);
+    memcpy(p, name, len);
+    memset(&ty, 0, sizeof ty);
+    ty.t = VT_PTR;
+    vpush_ref(&ty, sec, off, len);
+    vpush_helper_func(TOK_filc_unchecked);
+    vrott(2);
+}
+
 static int filc_is_yolo(const char *name)
 {
     static const char *const names[] = {
@@ -2346,6 +2390,18 @@ static int filc_is_ptr_arg(int t)
     return bt == VT_PTR || bt == VT_FUNC;
 }
 
+/* Variadic ints are what * and .* read. long is VT_INT or VT_LLONG
+ * plus VT_LONG, so the basic type is enough. Floats stay skipped. */
+static int filc_is_int_arg(int t)
+{
+    int bt;
+    if (t & (VT_ARRAY | VT_VLA))
+        return 0;
+    bt = t & VT_BTYPE;
+    return bt == VT_BYTE || bt == VT_SHORT || bt == VT_INT
+        || bt == VT_LLONG || bt == VT_BOOL;
+}
+
 /* The va_list is the last argument of every v* printf. */
 static void filc_emit_vprint(int ap_i)
 {
@@ -2361,6 +2417,7 @@ static void filc_emit_vprint(int ap_i)
 static void filc_emit_fmt(int fmt_i, int var_i, int nb, int is_v, int wide)
 {
     int i;
+    CType ty;
     filc_push_caparg(fmt_i);
     filc_push_ival(fmt_i);
     filc_finish_intercept(wide ? TOK_filc_wfmt_begin : TOK_filc_fmt_begin, 2);
@@ -2375,6 +2432,13 @@ static void filc_emit_fmt(int fmt_i, int var_i, int nb, int is_v, int wide)
             filc_push_ival(i);
             filc_finish_intercept(TOK_filc_fmt_ptr, 2);
             gfunc_call(2);
+        } else if (filc_is_int_arg(filc_sv[i].type.t)) {
+            filc_push_ival(i);
+            ty.t = VT_INT;
+            ty.ref = NULL;
+            gen_cast(&ty);
+            filc_finish_intercept(TOK_filc_fmt_int, 1);
+            gfunc_call(1);
         } else {
             vpush_helper_func(TOK_filc_fmt_skip);
             gfunc_call(0);
@@ -2451,6 +2515,31 @@ static int filc_try_bytes(const char *name, int *pnb)
         *pnb = 5;
         return 1;
     }
+    /* Locale is opaque, including LC_GLOBAL_LOCALE. The strings
+     * are checked the same way as the non-_l forms. */
+    if (!strcmp(name, "strcasecmp_l") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_strcasecmp_l, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "strncasecmp_l") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_strncasecmp_l, 6);
+        *pnb = 6;
+        return 1;
+    }
     if (!strcmp(name, "strcasestr") && nb == 2) {
         filc_spill_call(nb);
         filc_push_caparg(0);
@@ -2499,11 +2588,67 @@ static int filc_try_bytes(const char *name, int *pnb)
 }
 
 /* Number scans. The end pointer is an interior pointer into the source,
- * so it keeps that object's capability instead of whatever the slot held. */
+ * so it keeps that object's capability instead of whatever the slot held.
+ * The _l forms add an opaque locale. */
 static int filc_try_strto(const char *name, int *pnb)
 {
     int nb = *pnb;
     int tok = 0;
+    if (nb == 4) {
+        if (!strcmp(name, "wcstol_l"))
+            tok = TOK_filc_wcstol_l;
+        else if (!strcmp(name, "wcstoll_l"))
+            tok = TOK_filc_wcstoll_l;
+        else if (!strcmp(name, "wcstoul_l"))
+            tok = TOK_filc_wcstoul_l;
+        else if (!strcmp(name, "wcstoull_l"))
+            tok = TOK_filc_wcstoull_l;
+        else if (!strcmp(name, "strtol_l"))
+            tok = TOK_filc_strtol_l;
+        else if (!strcmp(name, "strtoll_l"))
+            tok = TOK_filc_strtoll_l;
+        else if (!strcmp(name, "strtoul_l"))
+            tok = TOK_filc_strtoul_l;
+        else if (!strcmp(name, "strtoull_l"))
+            tok = TOK_filc_strtoull_l;
+        if (!tok)
+            return 0;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(tok, 6);
+        *pnb = 6;
+        return 1;
+    }
+    if (nb == 3 && (!strcmp(name, "wcstof_l") || !strcmp(name, "wcstod_l")
+        || !strcmp(name, "wcstold_l") || !strcmp(name, "strtof_l")
+        || !strcmp(name, "strtod_l") || !strcmp(name, "strtold_l"))) {
+        if (!strcmp(name, "wcstof_l"))
+            tok = TOK_filc_wcstof_l;
+        else if (!strcmp(name, "wcstod_l"))
+            tok = TOK_filc_wcstod_l;
+        else if (!strcmp(name, "wcstold_l"))
+            tok = TOK_filc_wcstold_l;
+        else if (!strcmp(name, "strtof_l"))
+            tok = TOK_filc_strtof_l;
+        else if (!strcmp(name, "strtod_l"))
+            tok = TOK_filc_strtod_l;
+        else
+            tok = TOK_filc_strtold_l;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(tok, 5);
+        *pnb = 5;
+        return 1;
+    }
     if (nb == 3) {
         if (!strcmp(name, "strtol"))
             tok = TOK_filc_strtol;
@@ -3063,9 +3208,12 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
     } else if (!strcmp(name, "calloc")) {
         tok = TOK_filc_calloc;
         mode = FILC_RET_PTR;
+    } else if (!strcmp(name, "aligned_alloc")) {
+        tok = TOK_filc_aligned_alloc;
+        mode = FILC_RET_PTR;
     }
     /* strdup takes an extra lower; it is rebuilt below, not swapped in place. */
-    if (tok && (nb == 1 || (tok == TOK_filc_calloc && nb == 2))) {
+    if (tok && (nb == 1 || ((tok == TOK_filc_calloc || tok == TOK_filc_aligned_alloc) && nb == 2))) {
         fn->sym = external_helper_sym(tok);
         filc_ret_mode = mode;
         return 1;
@@ -3600,8 +3748,7 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         *pnb = 4;
         return 1;
     }
-    /* wcscasecmp is not wcscmp. wcsncasecmp is not wcsncmp.
-     * Exact names, so the _l forms stay out. */
+    /* wcscasecmp is not wcscmp. wcsncasecmp is not wcsncmp. */
     if (!strcmp(name, "wcscasecmp") && nb == 2) {
         filc_spill_call(nb);
         filc_push_caparg(0);
@@ -3634,6 +3781,259 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         *pnb = 5;
         return 1;
     }
+    /* Locale is opaque, including LC_GLOBAL_LOCALE. The wide strings
+     * are checked the same way as the forms without _l. */
+    if (!strcmp(name, "wcscoll_l") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_wcscoll_l, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "wcscasecmp_l") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_wcscasecmp_l, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "wcsncasecmp_l") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_wcsncasecmp_l, 6);
+        *pnb = 6;
+        return 1;
+    }
+    if (!strcmp(name, "wcsxfrm_l") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_wcsxfrm_l, 6);
+        *pnb = 6;
+        return 1;
+    }
+    /* wcsftime writes at most maxsize wchar_t. maxsize == 0 does not
+     * touch the destination. The format needs a terminator, and the
+     * whole struct tm is read. The locale is opaque. */
+    if (!strcmp(name, "wcsftime") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_push_caparg(3);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_wcsftime, 7);
+        *pnb = 7;
+        return 1;
+    }
+    if (!strcmp(name, "wcsftime_l") && nb == 5) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_push_caparg(3);
+        filc_push_ival(3);
+        filc_push_ival(4);
+        filc_finish_intercept(TOK_filc_wcsftime_l, 8);
+        *pnb = 8;
+        return 1;
+    }
+    /* strftime is the byte form. maxsize == 0 does not touch dest. */
+    if (!strcmp(name, "strftime") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_push_caparg(3);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_strftime, 7);
+        *pnb = 7;
+        return 1;
+    }
+    if (!strcmp(name, "strftime_l") && nb == 5) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_push_caparg(3);
+        filc_push_ival(3);
+        filc_push_ival(4);
+        filc_finish_intercept(TOK_filc_strftime_l, 8);
+        *pnb = 8;
+        return 1;
+    }
+    /* strptime returns the first unparsed byte of the source, or
+     * null. An empty format does not touch tm. Any other format may
+     * write fields before failing, so the whole struct is writable.
+     * The locale is opaque. */
+    if (!strcmp(name, "strptime") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_strptime, 6);
+        *pnb = 6;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "strptime_l") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_strptime_l, 7);
+        *pnb = 7;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    /* gmtime_r and localtime_r read one time_t and write a struct tm.
+     * A null tm is legal only for gmtime_r. asctime_r reads the struct
+     * and ctime_r reads one time_t. Both store 26 bytes. The return
+     * keeps that destination, or is null. */
+    if (!strcmp(name, "gmtime_r") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_gmtime_r, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "localtime_r") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_localtime_r, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "asctime_r") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_asctime_r, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "ctime_r") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_ctime_r, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    /* gmtime and localtime read one time_t and return one static
+     * struct tm. asctime and ctime return one static string. A null
+     * struct is legal only for asctime. The return is that libc
+     * object, or null. */
+    if (!strcmp(name, "gmtime") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_gmtime, 2);
+        *pnb = 2;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "localtime") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_localtime, 2);
+        *pnb = 2;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "asctime") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_asctime, 2);
+        *pnb = 2;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "ctime") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_ctime, 2);
+        *pnb = 2;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    /* mktime and timelocal read and write a struct tm. time writes
+     * one time_t when the pointer is non-null. A null time pointer
+     * only returns the current time. Both return time_t. */
+    if ((!strcmp(name, "mktime") || !strcmp(name, "timelocal")) && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_mktime, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if (!strcmp(name, "time") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_time, 2);
+        *pnb = 2;
+        return 1;
+    }
+    /* timegm reads and writes a struct tm in UTC. The return is time_t. */
+    if (!strcmp(name, "timegm") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_timegm, 2);
+        *pnb = 2;
+        return 1;
+    }
     /* strcoll and strxfrm are the byte forms of wcscoll and wcsxfrm. */
     if (!strcmp(name, "strcoll") && nb == 2) {
         filc_spill_call(nb);
@@ -3656,17 +4056,46 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         *pnb = 5;
         return 1;
     }
+    /* Locale is opaque, including LC_GLOBAL_LOCALE. The bytes are
+     * checked the same way as strcoll and strxfrm. */
+    if (!strcmp(name, "strcoll_l") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_strcoll_l, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "strxfrm_l") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_strxfrm_l, 6);
+        *pnb = 6;
+        return 1;
+    }
     /* btowc and wctob pass one character code. Neither touches a buffer. */
     if (!strcmp(name, "btowc") && nb == 1)
         return filc_passthru(TOK_filc_btowc, nb, pnb);
     if (!strcmp(name, "wctob") && nb == 1)
         return filc_passthru(TOK_filc_wctob, nb, pnb);
-    /* One code each. Exact names, so the _l forms stay out. */
+    /* One code each. The _l form also takes an opaque locale. */
     if (!strcmp(name, "towlower") && nb == 1)
         return filc_passthru(TOK_filc_towlower, nb, pnb);
     if (!strcmp(name, "towupper") && nb == 1)
         return filc_passthru(TOK_filc_towupper, nb, pnb);
-    /* One wide character class. Exact names, so the _l forms stay out. */
+    if (!strcmp(name, "towlower_l") && nb == 2)
+        return filc_passthru(TOK_filc_towlower_l, nb, pnb);
+    if (!strcmp(name, "towupper_l") && nb == 2)
+        return filc_passthru(TOK_filc_towupper_l, nb, pnb);
+    /* One wide character class. The _l form also takes an opaque locale. */
     if (!strcmp(name, "iswalnum") && nb == 1)
         return filc_passthru(TOK_filc_iswalnum, nb, pnb);
     if (!strcmp(name, "iswalpha") && nb == 1)
@@ -3691,9 +4120,33 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         return filc_passthru(TOK_filc_iswxdigit, nb, pnb);
     if (!strcmp(name, "iswblank") && nb == 1)
         return filc_passthru(TOK_filc_iswblank, nb, pnb);
+    if (!strcmp(name, "iswalnum_l") && nb == 2)
+        return filc_passthru(TOK_filc_iswalnum_l, nb, pnb);
+    if (!strcmp(name, "iswalpha_l") && nb == 2)
+        return filc_passthru(TOK_filc_iswalpha_l, nb, pnb);
+    if (!strcmp(name, "iswcntrl_l") && nb == 2)
+        return filc_passthru(TOK_filc_iswcntrl_l, nb, pnb);
+    if (!strcmp(name, "iswdigit_l") && nb == 2)
+        return filc_passthru(TOK_filc_iswdigit_l, nb, pnb);
+    if (!strcmp(name, "iswgraph_l") && nb == 2)
+        return filc_passthru(TOK_filc_iswgraph_l, nb, pnb);
+    if (!strcmp(name, "iswlower_l") && nb == 2)
+        return filc_passthru(TOK_filc_iswlower_l, nb, pnb);
+    if (!strcmp(name, "iswprint_l") && nb == 2)
+        return filc_passthru(TOK_filc_iswprint_l, nb, pnb);
+    if (!strcmp(name, "iswpunct_l") && nb == 2)
+        return filc_passthru(TOK_filc_iswpunct_l, nb, pnb);
+    if (!strcmp(name, "iswspace_l") && nb == 2)
+        return filc_passthru(TOK_filc_iswspace_l, nb, pnb);
+    if (!strcmp(name, "iswupper_l") && nb == 2)
+        return filc_passthru(TOK_filc_iswupper_l, nb, pnb);
+    if (!strcmp(name, "iswxdigit_l") && nb == 2)
+        return filc_passthru(TOK_filc_iswxdigit_l, nb, pnb);
+    if (!strcmp(name, "iswblank_l") && nb == 2)
+        return filc_passthru(TOK_filc_iswblank_l, nb, pnb);
     /* wctype and wctrans read one property name. The descriptor is
      * opaque: wctype_t is an integer, and wctrans_t points into libc.
-     * Exact names, so the _l forms stay out. */
+     * The _l forms add an opaque locale. */
     if (!strcmp(name, "wctype") && nb == 1) {
         filc_spill_call(nb);
         filc_push_caparg(0);
@@ -3702,8 +4155,19 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         *pnb = 2;
         return 1;
     }
+    if (!strcmp(name, "wctype_l") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_wctype_l, 3);
+        *pnb = 3;
+        return 1;
+    }
     if (!strcmp(name, "iswctype") && nb == 2)
         return filc_passthru(TOK_filc_iswctype, nb, pnb);
+    if (!strcmp(name, "iswctype_l") && nb == 3)
+        return filc_passthru(TOK_filc_iswctype_l, nb, pnb);
     if (!strcmp(name, "wctrans") && nb == 1) {
         filc_spill_call(nb);
         filc_push_caparg(0);
@@ -3712,8 +4176,19 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         *pnb = 2;
         return 1;
     }
+    if (!strcmp(name, "wctrans_l") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_wctrans_l, 3);
+        *pnb = 3;
+        return 1;
+    }
     if (!strcmp(name, "towctrans") && nb == 2)
         return filc_passthru(TOK_filc_towctrans, nb, pnb);
+    if (!strcmp(name, "towctrans_l") && nb == 3)
+        return filc_passthru(TOK_filc_towctrans_l, nb, pnb);
     /* mbrtowc[2] == 'r'; mbsrtowcs[2] == 's'. A null source is the reset. */
     if (!strcmp(name, "mbrtowc") && nb == 4) {
         filc_spill_call(nb);
@@ -3978,6 +4453,76 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         filc_ret_mode = FILC_RET_GET;
         return 1;
     }
+    if ((!strcmp(name, "gethostname") || !strcmp(name, "getdomainname"))
+        && nb == 2) {
+        /* gethostname[3] == 'h'; getdomainname[3] == 'd'. */
+        tok = name[3] == 'h' ? TOK_filc_gethostname : TOK_filc_getdomainname;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(tok, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "confstr") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_confstr, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "uname") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_uname, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if (!strcmp(name, "sysinfo") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_sysinfo, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if (!strcmp(name, "getrusage") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_getrusage, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "readlinkat") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_readlinkat, 6);
+        *pnb = 6;
+        return 1;
+    }
+    if (!strcmp(name, "readlink") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_readlink, 5);
+        *pnb = 5;
+        return 1;
+    }
     if ((!strcmp(name, "read") || !strcmp(name, "write")) && nb == 3) {
         /* read[0] == 'r'; write[0] == 'w'. The buffer is argument 1. */
         tok = name[0] == 'w' ? TOK_filc_write : TOK_filc_read;
@@ -4180,6 +4725,17 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         filc_push_ival(1);
         filc_finish_intercept(TOK_filc_rename, 4);
         *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "realpath") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_realpath, 4);
+        *pnb = 4;
+        filc_ret_mode = FILC_RET_GET;
         return 1;
     }
     if (!strcmp(name, "getcwd") && nb == 2) {
@@ -4576,6 +5132,11 @@ static void filc_prepare_call(int *pnb, int ret_bt, int sret_cap)
     }
     if (direct && filc_intercept(name, pnb, ret_ptr))
         return;
+    if (direct && name && filc_is_unchecked(name)) {
+        filc_emit_unchecked(name, nb);
+        *pnb = 1;
+        return;
+    }
     if (!direct)
         filc_check_indirect(nb);
     filc_pass_arg_caps(nb, sret_cap);

@@ -99,12 +99,17 @@ thread-local storage, which `tcc -run` does not provide.
 
 Direct and indirect calls to a large subset of libc are checked:
 strings, memory, stdio, wide and multibyte conversion, `malloc`,
-`dlopen` and the related functions, and the numeric conversions that
-the tests cover. The tests are `tests/filc/`. They are not part of
-`make test`.
+`dlopen` and the related functions, `aligned_alloc`, and the numeric conversions that
+the tests cover. Direct `printf`, `vprintf`, and a call through a
+function pointer check a positional `%N$` argument and treat a `.*`
+precision as that many bytes. A negative precision checks the whole
+string. The tests are `tests/filc/`. They are not part of `make test`.
 
-Still ordinary unchecked libc: threads, sockets, directories, `fork`,
-and any library you did not compile with `-filc`. The locale forms
-`strcasecmp_l`, `strncasecmp_l`, `strcoll_l`, and `strxfrm_l` are not
-intercepted. An unchecked callee does not publish a capability for a
-pointer it returns.
+A direct call, or a call through a function pointer, to `fork`,
+`vfork`, a socket call (`socket`, `bind`, `listen`, `accept`,
+`connect`, `send`, `recv`, and the `msg` forms), or a directory call
+(`opendir`, `readdir`, `closedir`, `scandir`, and the rest of that
+family) panics with `filc: unchecked <name>` before glibc runs. Threads stay ordinary libc: the collector stops them, and
+`tests/filc/gc_pause.c` and `gc_mt.c` use them. Any other library you
+did not compile with `-filc` stays unchecked. An unchecked callee does
+not publish a capability for a pointer it returns.

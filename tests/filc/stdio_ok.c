@@ -88,7 +88,7 @@ int main(void)
     r = sprintf(buf, "%%");
     if (r != 1 || buf[0] != '%')
         return 10;
-    /* Positional: the walk stops, and libc still sees every argument. */
+    /* Positional %2$s checks that argument, then libc prints it. */
     r = sprintf(buf, "%2$s", "no", "yes");
     if (r != 3 || strcmp(buf, "yes") != 0)
         return 11;

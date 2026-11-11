@@ -30,6 +30,14 @@
  * strnlen, strspn, strcspn, strpbrk, memcmp, memccpy, strndup, strtok,
  * strtok_r, strsep, bzero, and explicit_bzero). read, write, pread,
  * pwrite, fread, fwrite, and fgets check the buffer, then call libc.
+ * readlink checks a terminated path and bufsiz writable bytes. A
+ * bufsiz of 0 does not touch the buffer. readlinkat does the same
+ * and passes the directory fd through. gethostname and
+ * getdomainname check len writable bytes. A len of 0 does not
+ * touch the buffer. confstr checks len writable bytes. A len of
+ * 0 does not touch the buffer and may be a null pointer. uname
+ * checks a writable struct utsname. sysinfo checks a writable
+ * struct sysinfo. getrusage checks a writable struct rusage.
  * fgetws checks n wchar_t. A negative n panics. A zero n is a
  * size-0 check. The return keeps the buffer capability.
  * getline and getdelim do too. A buffer that cannot hold the line is
@@ -44,8 +52,10 @@
  * fgetpos writes one fpos_t. fsetpos reads one.
  * fseeko and ftello pass a FILE* and an off_t through.
  * setvbuf writes size bytes of a caller buffer. A null buffer is
- * the system buffer and is not checked. setbuf writes BUFSIZ bytes,
- * or nothing when its buffer is null.
+ * the system buffer and is not checked. A heap buffer stays reachable
+ * until fclose or a later successful setvbuf or setbuf. A stack buffer
+ * is checked at the call only. setbuf writes BUFSIZ bytes, or nothing
+ * when its buffer is null.
  * remove and rename require a terminator in each path.
  * fflush_unlocked, fgetc_unlocked, getc_unlocked, getchar_unlocked,
  * fputc_unlocked, putc_unlocked, putchar_unlocked, clearerr_unlocked,
@@ -67,9 +77,11 @@
  * vfprintf, vdprintf, vsprintf, and vsnprintf do the same checks: va_start
  * remembers which frame owns the register save area, and the walk
  * takes pointer capabilities from that frame. An indirect printf
- * walks its call frame the same way. A positional %N$ conversion
- * is not checked beyond the format string. A dynamic .* precision
- * requires a terminator instead of a byte count. %ls is a wide
+ * walks its call frame the same way. Direct printf, vprintf, and an
+ * indirect printf check a positional %N$ argument. A .* precision
+ * is a byte count, and a negative precision means the precision
+ * was omitted.
+ * %ls is a wide
  * string: no precision means a wchar terminator inside the object,
  * and a precision counts wchar_t. wprintf, fwprintf, swprintf, and
  * their v forms check a wide format the same way. swprintf's bound
@@ -121,11 +133,15 @@
  * btowc and wctob pass one character code and do not touch a caller buffer.
  * towlower and towupper do too. WEOF passes through.
  * iswalnum through iswblank pass one wint_t through and do not touch
- * a caller buffer. WEOF returns 0. The _l forms stay out.
+ * a caller buffer. WEOF returns 0. The _l forms pass that code and
+ * an opaque locale. LC_GLOBAL_LOCALE uses the plain function.
  * wctype and wctrans require a terminator in the property name.
- * The descriptor is opaque. wctype_t is an integer. wctrans_t points
- * into libc and is not a user object. iswctype and towctrans pass
- * that descriptor through.
+ * wctype_l and wctrans_l do too. The locale is opaque.
+ * LC_GLOBAL_LOCALE uses the plain constructor, because glibc
+ * dereferences that sentinel. The descriptor is opaque. wctype_t is
+ * an integer. wctrans_t points into libc and is not a user object.
+ * iswctype, towctrans, and their _l forms pass that descriptor
+ * through. iswctype_l and towctrans_l accept LC_GLOBAL_LOCALE.
  * mblen and mbtowc examine only the caller's byte count. A null
  * source is the reset and does not check a destination. wctomb
  * reserves MB_CUR_MAX bytes unless its destination is null.
@@ -138,6 +154,38 @@
  * same checks in bytes.
  * The updated pointer may be one past those bytes. wcstol and the other wide strto functions require a
  * terminator and store the end pointer with the source capability.
+ * The wide _l forms do the same. The byte _l forms do the same.
+ * The locale is opaque. LC_GLOBAL_LOCALE uses the plain function,
+ * because glibc dereferences that sentinel. glibc renames the
+ * integer _l forms to __isoc23_*_l, and those addresses are adapted too.
+ * wcsftime requires a wide terminator in the format and reads the
+ * whole struct tm. maxsize == 0 does not touch the destination.
+ * wcsftime_l does the same. strftime and strftime_l do the same
+ * checks in bytes. A %Z conversion checks tm_zone when that field
+ * is set. A format that does not use %Z leaves the field alone.
+ * strptime requires a terminator in the string and the format. An
+ * empty format does not touch struct tm, so a null struct is legal.
+ * Any other format requires the whole struct to be writable, because
+ * a failed parse may already have written fields. The return is the
+ * first unparsed byte and keeps the source capability, or null.
+ * strptime_l does the same. LC_GLOBAL_LOCALE uses strptime.
+ * gmtime_r and localtime_r read one time_t and write a struct tm.
+ * A null struct is legal only for gmtime_r. asctime_r reads the
+ * struct and ctime_r reads one time_t. Both store 26 bytes, including
+ * when the result does not fit and the call returns null. The return
+ * keeps that destination. On success, a non-null tm_zone is a
+ * read-only string.
+ * gmtime and localtime read one time_t and return one static struct
+ * tm. That cover is writable and is sizeof(struct tm). asctime and
+ * ctime return one static string. That cover is read-only and is
+ * strlen+1, including a year that does not fit in 26 bytes. A null
+ * struct is legal only for asctime. On success, a non-null tm_zone
+ * is a read-only string.
+ * mktime and timelocal read and write a whole struct tm, including
+ * when they normalize a field. time writes one time_t when the
+ * pointer is non-null. A null pointer only returns the current time.
+ * timegm reads and writes a whole struct tm in UTC. On success, a
+ * non-null tm_zone is a read-only string.
  * strtoimax, strtoumax, wcstoimax, and wcstoumax do the same.
  * mmap covers the returned mapping; munmap and mprotect must
  * name that whole object. qsort is a heapsort whose swaps go through
@@ -146,6 +194,13 @@
  * key and the array, then libc searches; a hit keeps the array's
  * capability. Nested qsort or bsearch stops at eight frames.
  * strcasecmp, strncasecmp, strcasestr, and memmem check their inputs.
+ * strcasecmp_l, strncasecmp_l, strcoll_l, and strxfrm_l do the same
+ * checks as the forms without _l. wcscoll_l, wcsxfrm_l, wcscasecmp_l,
+ * and wcsncasecmp_l do the same checks as the wide forms without _l.
+ * The locale pointer is opaque and is not checked. LC_GLOBAL_LOCALE
+ * uses the plain global-locale function, because glibc's *_l form
+ * would dereference that sentinel. n == 0 does not read. strxfrm_l
+ * and wcsxfrm_l with n == 0 do not touch dest.
  * A match keeps the haystack capability. stat, lstat, and fstat check
  * the path and the whole struct stat. strtol, strtoll, strtoul,
  * strtoull, strtof, strtod, and strtold require a terminator inside
@@ -154,7 +209,10 @@
  * checks a caller buffer for a writable size bytes and keeps that
  * object's capability. A null buffer is the glibc extension: the
  * result is a filc heap object of size bytes, or of the path length
- * when size is 0, and the libc buffer is freed. sscanf requires a
+ * when size is 0, and the libc buffer is freed. realpath checks a
+ * terminated path. A caller buffer must hold PATH_MAX writable bytes.
+ * A null buffer is copied into a filc heap object of the path length
+ * and the libc buffer is freed. sscanf requires a
  * terminator in the source and the format. Each storing conversion
  * checks a writable destination of that conversion's size. %s and
  * scansets need an explicit width. %ls with a width stores that many
@@ -218,7 +276,13 @@
 #include <stdarg.h>
 #include <sys/mman.h>
 #include <strings.h>
+#include <locale.h>
+#include <time.h>
+#include <limits.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
+#include <sys/sysinfo.h>
+#include <sys/resource.h>
 
 /* glibc headers #define __attribute__ to empty when __has_attribute is 0.
  * tcc still parses attributes; bcheck.c and bt-log.c undef the same way. */
@@ -499,6 +563,16 @@ void filc_panic(const char *msg)
     abort();
 }
 
+/* Direct calls to these libc entries are not wrapped. Panic here, before
+ * glibc reads a caller pointer. Threads stay callable: stop-the-world
+ * uses them, and tests/filc/gc_pause.c and gc_mt.c do too. */
+void filc_unchecked(const char *name)
+{
+    fprintf(stderr, "filc: unchecked %s\n", name ? name : "libc");
+    fflush(stderr);
+    abort();
+}
+
 static unsigned filc_hash(void *p)
 {
     uintptr_t x = (uintptr_t)p >> 3;
@@ -669,8 +743,13 @@ void filc_check(void *lower, void *ptr, size_t size, int write)
         filc_panic("null capability");
     }
     if (p < lo || p > hi || size > (size_t)(hi - p)) {
+        void *ret = __builtin_return_address(0);
         filc_unlock();
-        filc_panic("out of bounds");
+        fprintf(stderr,
+            "filc: out of bounds ptr=%p lower=%p upper=%p size=%zu ret=%p\n",
+            ptr, (void *)lo, (void *)hi, size, ret);
+        fflush(stderr);
+        abort();
     }
     filc_unlock();
 }
@@ -791,20 +870,28 @@ __attribute__((constructor)) static void filc_init_globals(void)
     filc_apply_inits();
 }
 
-static void *filc_alloc_heap(size_t size, int zero)
+static void *filc_alloc_heap_at(size_t size, size_t align, int zero)
 {
-    size_t hdr, total;
+    size_t hdr, pad, total;
     char *block;
     filc_object *o;
     void *payload;
+    uintptr_t raw, aligned;
     hdr = (sizeof(filc_object) + 15) & ~(size_t)15;
-    if (size > (size_t)-1 - hdr)
+    if (align < 16)
+        align = 16;
+    /* block and hdr are 16-aligned, so the payload needs at most
+     * align-16 bytes of padding to land on align. */
+    pad = align - 16;
+    if (pad > (size_t)-1 - hdr || size > (size_t)-1 - hdr - pad)
         return NULL;
-    total = hdr + size;
+    total = hdr + pad + size;
     block = zero ? (char *)calloc(1, total) : (char *)malloc(total);
     if (!block)
         return NULL;
-    payload = block + hdr;
+    raw = (uintptr_t)(block + hdr);
+    aligned = (raw + align - 1) & ~(align - 1);
+    payload = (void *)aligned;
     o = (filc_object *)block;
     o->magic = FILC_MAGIC;
     o->flags = FILC_HEAP;
@@ -818,6 +905,19 @@ static void *filc_alloc_heap(size_t size, int zero)
     filc_insert(o);
     filc_unlock();
     return payload;
+}
+
+static void *filc_alloc_heap(size_t size, int zero)
+{
+    return filc_alloc_heap_at(size, 16, zero);
+}
+
+void *filc_aligned_alloc(size_t align, size_t size)
+{
+    if (!align || (align & (align - 1)) || size % align)
+        return NULL;
+    filc_maybe_gc();
+    return filc_alloc_heap_at(size, align, 0);
 }
 
 void *filc_malloc(size_t size)
@@ -1497,6 +1597,21 @@ wint_t filc_towupper(wint_t wc)
     return towupper(wc);
 }
 
+/* glibc dereferences the locale, so the sentinel is the plain call. */
+wint_t filc_towlower_l(wint_t wc, locale_t loc)
+{
+    if (loc == LC_GLOBAL_LOCALE)
+        return towlower(wc);
+    return towlower_l(wc, loc);
+}
+
+wint_t filc_towupper_l(wint_t wc, locale_t loc)
+{
+    if (loc == LC_GLOBAL_LOCALE)
+        return towupper(wc);
+    return towupper_l(wc, loc);
+}
+
 int filc_iswalnum(wint_t wc) { return iswalnum(wc); }
 int filc_iswalpha(wint_t wc) { return iswalpha(wc); }
 int filc_iswcntrl(wint_t wc) { return iswcntrl(wc); }
@@ -1509,6 +1624,80 @@ int filc_iswspace(wint_t wc) { return iswspace(wc); }
 int filc_iswupper(wint_t wc) { return iswupper(wc); }
 int filc_iswxdigit(wint_t wc) { return iswxdigit(wc); }
 int filc_iswblank(wint_t wc) { return iswblank(wc); }
+
+/* glibc dereferences the locale, so the sentinel is the plain call. */
+int filc_iswalnum_l(wint_t wc, locale_t loc)
+{
+    if (loc == LC_GLOBAL_LOCALE)
+        return iswalnum(wc);
+    return iswalnum_l(wc, loc);
+}
+int filc_iswalpha_l(wint_t wc, locale_t loc)
+{
+    if (loc == LC_GLOBAL_LOCALE)
+        return iswalpha(wc);
+    return iswalpha_l(wc, loc);
+}
+int filc_iswcntrl_l(wint_t wc, locale_t loc)
+{
+    if (loc == LC_GLOBAL_LOCALE)
+        return iswcntrl(wc);
+    return iswcntrl_l(wc, loc);
+}
+int filc_iswdigit_l(wint_t wc, locale_t loc)
+{
+    if (loc == LC_GLOBAL_LOCALE)
+        return iswdigit(wc);
+    return iswdigit_l(wc, loc);
+}
+int filc_iswgraph_l(wint_t wc, locale_t loc)
+{
+    if (loc == LC_GLOBAL_LOCALE)
+        return iswgraph(wc);
+    return iswgraph_l(wc, loc);
+}
+int filc_iswlower_l(wint_t wc, locale_t loc)
+{
+    if (loc == LC_GLOBAL_LOCALE)
+        return iswlower(wc);
+    return iswlower_l(wc, loc);
+}
+int filc_iswprint_l(wint_t wc, locale_t loc)
+{
+    if (loc == LC_GLOBAL_LOCALE)
+        return iswprint(wc);
+    return iswprint_l(wc, loc);
+}
+int filc_iswpunct_l(wint_t wc, locale_t loc)
+{
+    if (loc == LC_GLOBAL_LOCALE)
+        return iswpunct(wc);
+    return iswpunct_l(wc, loc);
+}
+int filc_iswspace_l(wint_t wc, locale_t loc)
+{
+    if (loc == LC_GLOBAL_LOCALE)
+        return iswspace(wc);
+    return iswspace_l(wc, loc);
+}
+int filc_iswupper_l(wint_t wc, locale_t loc)
+{
+    if (loc == LC_GLOBAL_LOCALE)
+        return iswupper(wc);
+    return iswupper_l(wc, loc);
+}
+int filc_iswxdigit_l(wint_t wc, locale_t loc)
+{
+    if (loc == LC_GLOBAL_LOCALE)
+        return iswxdigit(wc);
+    return iswxdigit_l(wc, loc);
+}
+int filc_iswblank_l(wint_t wc, locale_t loc)
+{
+    if (loc == LC_GLOBAL_LOCALE)
+        return iswblank(wc);
+    return iswblank_l(wc, loc);
+}
 
 wctype_t filc_wctype(void *pl, const char *property)
 {
@@ -1530,6 +1719,36 @@ wctrans_t filc_wctrans(void *pl, const char *property)
 wint_t filc_towctrans(wint_t wc, wctrans_t desc)
 {
     return towctrans(wc, desc);
+}
+
+/* Locale stays opaque bits. glibc's wctype_l and wctrans_l
+ * dereference it, so LC_GLOBAL_LOCALE is the plain constructor.
+ * iswctype_l and towctrans_l accept the sentinel. The descriptor
+ * is not a filc object. */
+wctype_t filc_wctype_l(void *pl, const char *property, locale_t loc)
+{
+    filc_strlen(pl, property);
+    if (loc == LC_GLOBAL_LOCALE)
+        return wctype(property);
+    return wctype_l(property, loc);
+}
+
+int filc_iswctype_l(wint_t wc, wctype_t desc, locale_t loc)
+{
+    return iswctype_l(wc, desc, loc);
+}
+
+wctrans_t filc_wctrans_l(void *pl, const char *property, locale_t loc)
+{
+    filc_strlen(pl, property);
+    if (loc == LC_GLOBAL_LOCALE)
+        return wctrans(property);
+    return wctrans_l(property, loc);
+}
+
+wint_t filc_towctrans_l(wint_t wc, wctrans_t desc, locale_t loc)
+{
+    return towctrans_l(wc, desc, loc);
 }
 
 /* A null source is the reset: the count is ignored. */
@@ -1608,6 +1827,367 @@ size_t filc_wcsxfrm(void *dl, wchar_t *dest, void *sl, const wchar_t *src,
     return wcsxfrm(dest, src, n);
 }
 
+/* Locale stays opaque bits and is not a filc object. glibc's wide
+ * *_l forms dereference the locale, so LC_GLOBAL_LOCALE is the plain
+ * global-locale call instead. n == 0 does not read. wcsxfrm_l with
+ * n == 0 does not touch dest. */
+int filc_wcscoll_l(void *al, const wchar_t *a, void *bl, const wchar_t *b,
+    locale_t loc)
+{
+    filc_wcslen(al, a);
+    filc_wcslen(bl, b);
+    if (loc == LC_GLOBAL_LOCALE)
+        return wcscoll(a, b);
+    return wcscoll_l(a, b, loc);
+}
+
+int filc_wcscasecmp_l(void *al, const wchar_t *a, void *bl, const wchar_t *b,
+    locale_t loc)
+{
+    filc_wcslen(al, a);
+    filc_wcslen(bl, b);
+    if (loc == LC_GLOBAL_LOCALE)
+        return wcscasecmp(a, b);
+    return wcscasecmp_l(a, b, loc);
+}
+
+int filc_wcsncasecmp_l(void *al, const wchar_t *a, void *bl, const wchar_t *b,
+    size_t n, locale_t loc)
+{
+    filc_wcsnlen(al, a, n);
+    filc_wcsnlen(bl, b, n);
+    if (loc == LC_GLOBAL_LOCALE)
+        return wcsncasecmp(a, b, n);
+    return wcsncasecmp_l(a, b, n, loc);
+}
+
+size_t filc_wcsxfrm_l(void *dl, wchar_t *dest, void *sl, const wchar_t *src,
+    size_t n, locale_t loc)
+{
+    filc_wcslen(sl, src);
+    if (n)
+        filc_check(dl, dest, filc_wbytes(n), 1);
+    if (loc == LC_GLOBAL_LOCALE)
+        return wcsxfrm(dest, src, n);
+    return wcsxfrm_l(dest, src, n, loc);
+}
+
+/* %Z reads tm_zone when that field is set. %%Z is a literal.
+ * Flags, a width, and an E or O modifier may sit in front of Z. */
+static int filc_fmt_uses_zone(const char *s)
+{
+    while (s && *s) {
+        if (*s != '%') {
+            s++;
+            continue;
+        }
+        s++;
+        if (*s == '%') {
+            s++;
+            continue;
+        }
+        while (*s == '-' || *s == '_' || *s == '0' || *s == '^' || *s == '#')
+            s++;
+        while (*s >= '0' && *s <= '9')
+            s++;
+        if (*s == 'E' || *s == 'O')
+            s++;
+        if (*s == 'Z')
+            return 1;
+        if (*s)
+            s++;
+    }
+    return 0;
+}
+
+static int filc_wfmt_uses_zone(const wchar_t *s)
+{
+    while (s && *s) {
+        if (*s != L'%') {
+            s++;
+            continue;
+        }
+        s++;
+        if (*s == L'%') {
+            s++;
+            continue;
+        }
+        while (*s == L'-' || *s == L'_' || *s == L'0' || *s == L'^'
+            || *s == L'#')
+            s++;
+        while (*s >= L'0' && *s <= L'9')
+            s++;
+        if (*s == L'E' || *s == L'O')
+            s++;
+        if (*s == L'Z')
+            return 1;
+        if (*s)
+            s++;
+    }
+    return 0;
+}
+
+/* A null tm_zone lets glibc use its own name. A set field is a
+ * caller string, so it needs a terminator before glibc reads it. */
+static void filc_check_tm_zone(void *tl, const struct tm *tp)
+{
+    const char *z;
+    void *zl;
+    if (!tp)
+        return;
+    z = tp->tm_zone;
+    if (!z)
+        return;
+    zl = filc_load_cap(tl, (void *)&tp->tm_zone);
+    filc_strlen(zl, z);
+}
+
+/* maxsize == 0 does not touch dest. The format needs a wide
+ * terminator. The whole struct tm is read. %Z checks tm_zone.
+ * glibc's wcsftime_l dereferences the locale, so
+ * LC_GLOBAL_LOCALE is the plain call. */
+static void filc_wcsftime_check(void *dl, wchar_t *s, size_t maxsize,
+    void *fl, const wchar_t *format, void *tl, const struct tm *tp)
+{
+    filc_wcslen(fl, format);
+    filc_check(tl, (void *)tp, sizeof(*tp), 0);
+    if (filc_wfmt_uses_zone(format))
+        filc_check_tm_zone(tl, tp);
+    if (maxsize)
+        filc_check(dl, s, filc_wbytes(maxsize), 1);
+}
+
+size_t filc_wcsftime(void *dl, wchar_t *s, size_t maxsize,
+    void *fl, const wchar_t *format, void *tl, const struct tm *tp)
+{
+    filc_wcsftime_check(dl, s, maxsize, fl, format, tl, tp);
+    return wcsftime(s, maxsize, format, tp);
+}
+
+size_t filc_wcsftime_l(void *dl, wchar_t *s, size_t maxsize,
+    void *fl, const wchar_t *format, void *tl, const struct tm *tp,
+    locale_t loc)
+{
+    filc_wcsftime_check(dl, s, maxsize, fl, format, tl, tp);
+    if (loc == LC_GLOBAL_LOCALE)
+        return wcsftime(s, maxsize, format, tp);
+    return wcsftime_l(s, maxsize, format, tp, loc);
+}
+
+/* maxsize == 0 does not touch dest. The format needs a byte
+ * terminator. The whole struct tm is read. %Z checks tm_zone.
+ * glibc's strftime_l dereferences the locale, so
+ * LC_GLOBAL_LOCALE is the plain call. */
+static void filc_strftime_check(void *dl, char *s, size_t maxsize,
+    void *fl, const char *format, void *tl, const struct tm *tp)
+{
+    filc_strlen(fl, format);
+    filc_check(tl, (void *)tp, sizeof(*tp), 0);
+    if (filc_fmt_uses_zone(format))
+        filc_check_tm_zone(tl, tp);
+    if (maxsize)
+        filc_check(dl, s, maxsize, 1);
+}
+
+size_t filc_strftime(void *dl, char *s, size_t maxsize,
+    void *fl, const char *format, void *tl, const struct tm *tp)
+{
+    filc_strftime_check(dl, s, maxsize, fl, format, tl, tp);
+    return strftime(s, maxsize, format, tp);
+}
+
+size_t filc_strftime_l(void *dl, char *s, size_t maxsize,
+    void *fl, const char *format, void *tl, const struct tm *tp,
+    locale_t loc)
+{
+    filc_strftime_check(dl, s, maxsize, fl, format, tl, tp);
+    if (loc == LC_GLOBAL_LOCALE)
+        return strftime(s, maxsize, format, tp);
+    return strftime_l(s, maxsize, format, tp, loc);
+}
+
+/* An empty format does not touch tm. Anything else may write fields
+ * before failing, so the whole struct is writable. Pointers inside
+ * it are not checked. A hit keeps the source capability. */
+static void filc_strptime_check(void *sl, const char *s,
+    void *fl, const char *format, void *tl, struct tm *tp)
+{
+    filc_strlen(sl, s);
+    filc_strlen(fl, format);
+    if (format[0])
+        filc_check(tl, (void *)tp, sizeof(*tp), 1);
+}
+
+static char *filc_strptime_ret(void *sl, char *r)
+{
+    filc_ret_cap = r ? sl : NULL;
+    return r;
+}
+
+char *filc_strptime(void *sl, const char *s, void *fl, const char *format,
+    void *tl, struct tm *tp)
+{
+    filc_strptime_check(sl, s, fl, format, tl, tp);
+    return filc_strptime_ret(sl, strptime(s, format, tp));
+}
+
+char *filc_strptime_l(void *sl, const char *s, void *fl, const char *format,
+    void *tl, struct tm *tp, locale_t loc)
+{
+    char *r;
+    filc_strptime_check(sl, s, fl, format, tl, tp);
+    if (loc == LC_GLOBAL_LOCALE)
+        r = strptime(s, format, tp);
+    else
+        r = strptime_l(s, format, tp, loc);
+    return filc_strptime_ret(sl, r);
+}
+
+/* glibc writes tm_zone. Publish it so a later strlen sees a capability.
+ * The bytes stay libc-owned and read-only. A null field is left alone. */
+static void filc_publish_tm_zone(void *tl, struct tm *tp)
+{
+    const char *z;
+    size_t n;
+    void *zl;
+    if (!tp)
+        return;
+    z = tp->tm_zone;
+    if (!z)
+        return;
+    n = strlen(z);
+    zl = filc_cover((void *)z, n + 1, FILC_READONLY);
+    filc_store_ptr(tl, (void *)&tp->tm_zone, zl, (uintptr_t)z);
+}
+
+/* A null tm is legal only for gmtime_r. localtime_r always writes.
+ * The return keeps the destination. */
+static struct tm *filc_tmr_ret(void *dl, struct tm *r)
+{
+    filc_ret_cap = r ? dl : NULL;
+    return r;
+}
+
+struct tm *filc_gmtime_r(void *tl, const time_t *timer, void *dl, struct tm *tp)
+{
+    struct tm *r;
+    filc_check(tl, (void *)timer, sizeof(*timer), 0);
+    if (tp)
+        filc_check(dl, (void *)tp, sizeof(*tp), 1);
+    r = gmtime_r(timer, tp);
+    if (r)
+        filc_publish_tm_zone(dl, tp);
+    return filc_tmr_ret(dl, r);
+}
+
+struct tm *filc_localtime_r(void *tl, const time_t *timer, void *dl,
+    struct tm *tp)
+{
+    struct tm *r;
+    filc_check(tl, (void *)timer, sizeof(*timer), 0);
+    filc_check(dl, (void *)tp, sizeof(*tp), 1);
+    r = localtime_r(timer, tp);
+    if (r)
+        filc_publish_tm_zone(dl, tp);
+    return filc_tmr_ret(dl, r);
+}
+
+/* "Day Mon dd hh:mm:ss yyyy\n" plus a NUL is 26 bytes. A year that
+ * does not fit still touches those bytes and returns null. */
+static char *filc_asc_ret(void *dl, char *r)
+{
+    filc_ret_cap = r ? dl : NULL;
+    return r;
+}
+
+char *filc_asctime_r(void *tl, const struct tm *tp, void *dl, char *buf)
+{
+    filc_check(tl, (void *)tp, sizeof(*tp), 0);
+    filc_check(dl, buf, 26, 1);
+    return filc_asc_ret(dl, asctime_r(tp, buf));
+}
+
+char *filc_ctime_r(void *tl, const time_t *timer, void *dl, char *buf)
+{
+    filc_check(tl, (void *)timer, sizeof(*timer), 0);
+    filc_check(dl, buf, 26, 1);
+    return filc_asc_ret(dl, ctime_r(timer, buf));
+}
+
+/* The two calls share one static struct. A second cover finds that
+ * same payload and does not shrink it or clear writable. */
+static struct tm *filc_libc_tm(struct tm *r)
+{
+    if (!r) {
+        filc_ret_cap = NULL;
+        return NULL;
+    }
+    filc_cover(r, sizeof(*r), 0);
+    filc_publish_tm_zone(r, r);
+    filc_ret_cap = r;
+    return r;
+}
+
+static char *filc_libc_str(char *s);
+
+struct tm *filc_gmtime(void *tl, const time_t *timer)
+{
+    filc_check(tl, (void *)timer, sizeof(*timer), 0);
+    return filc_libc_tm(gmtime(timer));
+}
+
+struct tm *filc_localtime(void *tl, const time_t *timer)
+{
+    filc_check(tl, (void *)timer, sizeof(*timer), 0);
+    return filc_libc_tm(localtime(timer));
+}
+
+/* A null struct is legal and returns null. A year that does not fit
+ * can return a string longer than 26 bytes. */
+char *filc_asctime(void *tl, const struct tm *tp)
+{
+    if (tp)
+        filc_check(tl, (void *)tp, sizeof(*tp), 0);
+    return filc_libc_str(asctime(tp));
+}
+
+char *filc_ctime(void *tl, const time_t *timer)
+{
+    filc_check(tl, (void *)timer, sizeof(*timer), 0);
+    return filc_libc_str(ctime(timer));
+}
+
+/* timelocal is the same libc function. The call may normalize fields
+ * and store tm_gmtoff. On success, a non-null tm_zone is published. */
+time_t filc_mktime(void *tl, struct tm *tp)
+{
+    time_t r;
+    filc_check(tl, tp, sizeof(*tp), 1);
+    r = mktime(tp);
+    if (r != (time_t)-1)
+        filc_publish_tm_zone(tl, tp);
+    return r;
+}
+
+/* A null pointer does not write. */
+time_t filc_time(void *tl, time_t *timer)
+{
+    if (timer)
+        filc_check(tl, timer, sizeof(*timer), 1);
+    return time(timer);
+}
+
+/* UTC mktime. On success, a non-null tm_zone is published. */
+time_t filc_timegm(void *tl, struct tm *tp)
+{
+    time_t r;
+    filc_check(tl, tp, sizeof(*tp), 1);
+    r = timegm(tp);
+    if (r != (time_t)-1)
+        filc_publish_tm_zone(tl, tp);
+    return r;
+}
+
 int filc_strcoll(void *al, const char *a, void *bl, const char *b)
 {
     filc_strlen(al, a);
@@ -1622,6 +2202,31 @@ size_t filc_strxfrm(void *dl, char *dest, void *sl, const char *src, size_t n)
     if (n)
         filc_check(dl, dest, n, 1);
     return strxfrm(dest, src, n);
+}
+
+/* Locale stays opaque bits and is not a filc object. glibc's
+ * strcoll_l and strxfrm_l dereference the locale, so
+ * LC_GLOBAL_LOCALE is the plain global-locale call instead.
+ * n == 0 sizes the result and does not touch dest. */
+int filc_strcoll_l(void *al, const char *a, void *bl, const char *b,
+    locale_t loc)
+{
+    filc_strlen(al, a);
+    filc_strlen(bl, b);
+    if (loc == LC_GLOBAL_LOCALE)
+        return strcoll(a, b);
+    return strcoll_l(a, b, loc);
+}
+
+size_t filc_strxfrm_l(void *dl, char *dest, void *sl, const char *src,
+    size_t n, locale_t loc)
+{
+    filc_strlen(sl, src);
+    if (n)
+        filc_check(dl, dest, n, 1);
+    if (loc == LC_GLOBAL_LOCALE)
+        return strxfrm(dest, src, n);
+    return strxfrm_l(dest, src, n, loc);
 }
 
 int filc_strcmp(void *al, const char *a, void *bl, const char *b)
@@ -3005,6 +3610,68 @@ ssize_t filc_read(void *lower, int fd, void *buf, size_t count)
     return read(fd, buf, count);
 }
 
+/* The path is a string. The buffer is bufsiz bytes and is not
+ * terminated by the call. A zero size does not write. */
+ssize_t filc_readlink(void *pl, const char *path, void *bl, char *buf,
+    size_t bufsiz)
+{
+    filc_strlen(pl, path);
+    if (bufsiz)
+        filc_check(bl, buf, bufsiz, 1);
+    return readlink(path, buf, bufsiz);
+}
+
+ssize_t filc_readlinkat(int dirfd, void *pl, const char *path, void *bl,
+    char *buf, size_t bufsiz)
+{
+    filc_strlen(pl, path);
+    if (bufsiz)
+        filc_check(bl, buf, bufsiz, 1);
+    return readlinkat(dirfd, path, buf, bufsiz);
+}
+
+/* len bytes are writable. A zero length does not write. */
+int filc_gethostname(void *bl, char *name, size_t len)
+{
+    if (len)
+        filc_check(bl, name, len, 1);
+    return gethostname(name, len);
+}
+
+int filc_getdomainname(void *bl, char *name, size_t len)
+{
+    if (len)
+        filc_check(bl, name, len, 1);
+    return getdomainname(name, len);
+}
+
+/* len bytes are writable. A zero length does not write, and buf
+ * may be null. The return is the size glibc would store. */
+size_t filc_confstr(int name, void *bl, char *buf, size_t len)
+{
+    if (len)
+        filc_check(bl, buf, len, 1);
+    return confstr(name, buf, len);
+}
+
+int filc_uname(void *bl, struct utsname *buf)
+{
+    filc_check(bl, buf, sizeof(*buf), 1);
+    return uname(buf);
+}
+
+int filc_sysinfo(void *bl, struct sysinfo *info)
+{
+    filc_check(bl, info, sizeof(*info), 1);
+    return sysinfo(info);
+}
+
+int filc_getrusage(int who, void *bl, struct rusage *usage)
+{
+    filc_check(bl, usage, sizeof(*usage), 1);
+    return getrusage(who, usage);
+}
+
 ssize_t filc_write(void *lower, int fd, const void *buf, size_t count)
 {
     filc_check(lower, (void *)buf, count, 0);
@@ -3215,6 +3882,39 @@ char *filc_getcwd(void *lower, char *buf, size_t size)
     filc_check(lower, buf, size, 1);
     r = getcwd(buf, size);
     filc_ret_cap = r ? lower : NULL;
+    return r;
+}
+
+/* A caller buffer is PATH_MAX bytes. realpath(path, NULL) mallocs;
+ * that pointer would be foreign, so copy strlen+1 into a filc heap
+ * object and free the libc buffer. */
+char *filc_realpath(void *pl, const char *path, void *bl, char *buf)
+{
+    char *r;
+    filc_strlen(pl, path);
+    if (!buf) {
+        size_t n;
+        char *d;
+        r = realpath(path, NULL);
+        if (!r) {
+            filc_ret_cap = NULL;
+            return NULL;
+        }
+        n = strlen(r) + 1;
+        d = filc_malloc(n);
+        if (!d) {
+            free(r);
+            filc_ret_cap = NULL;
+            return NULL;
+        }
+        memcpy(d, r, n);
+        free(r);
+        filc_ret_cap = d;
+        return d;
+    }
+    filc_check(bl, buf, PATH_MAX, 1);
+    r = realpath(path, buf);
+    filc_ret_cap = r ? bl : NULL;
     return r;
 }
 
@@ -3780,10 +4480,15 @@ int filc_fputws(void *lower, const wchar_t *s, FILE *stream)
 }
 
 /* fclose, fflush, fputc, putchar, close, and lseek carry no buffer.
- * FILE* stays the libc pointer bits. fflush(NULL) flushes every stream. */
+ * FILE* stays the libc pointer bits. fflush(NULL) flushes every stream.
+ * fclose drops a heap buffer pinned by setvbuf, whether or not it
+ * reports success: the stream is no longer associated with the file. */
+static void filc_stdio_pin(FILE *fp, void *lower);
 int filc_fclose(FILE *stream)
 {
-    return fclose(stream);
+    int r = fclose(stream);
+    filc_stdio_pin(stream, NULL);
+    return r;
 }
 
 int filc_fflush(FILE *stream)
@@ -3941,13 +4646,74 @@ off_t filc_ftello(FILE *stream)
     return ftello(stream);
 }
 
-/* Null means libc allocates the buffer. A caller buffer stays live
- * for the rest of the stream; the check is this call only. */
+/* A heap buffer passed to stdio is not a filc root by itself: glibc
+ * keeps the address inside FILE, which the collector does not scan.
+ * Pin that object until the stream drops it. Stack objects are not
+ * heap, so they are not pinned. */
+struct filc_stdio_pin {
+    FILE *fp;
+    filc_object *obj;
+};
+static struct filc_stdio_pin *filc_stdio_pins;
+static int filc_stdio_npins, filc_stdio_cap;
+
+static void filc_stdio_pin(FILE *fp, void *lower)
+{
+    filc_object *o;
+    int i;
+    if (!fp)
+        return;
+    filc_lock();
+    o = NULL;
+    if (lower) {
+        o = filc_lookup(lower);
+        if (!o || !(o->flags & FILC_HEAP))
+            o = NULL;
+    }
+    for (i = 0; i < filc_stdio_npins; i++) {
+        if (filc_stdio_pins[i].fp != fp)
+            continue;
+        if (o) {
+            filc_stdio_pins[i].obj = o;
+        } else {
+            filc_stdio_pins[i] = filc_stdio_pins[--filc_stdio_npins];
+        }
+        filc_unlock();
+        return;
+    }
+    if (!o) {
+        filc_unlock();
+        return;
+    }
+    if (filc_stdio_npins >= filc_stdio_cap) {
+        int nc = filc_stdio_cap ? filc_stdio_cap * 2 : 8;
+        struct filc_stdio_pin *p;
+        p = (struct filc_stdio_pin *)realloc(filc_stdio_pins,
+            (size_t)nc * sizeof(*p));
+        if (!p) {
+            filc_unlock();
+            filc_panic("out of memory");
+        }
+        filc_stdio_pins = p;
+        filc_stdio_cap = nc;
+    }
+    filc_stdio_pins[filc_stdio_npins].fp = fp;
+    filc_stdio_pins[filc_stdio_npins].obj = o;
+    filc_stdio_npins++;
+    filc_unlock();
+}
+
+/* Null means libc allocates the buffer. A heap buffer stays reachable
+ * for the rest of the stream. A stack buffer is checked at this call. */
 int filc_setvbuf(FILE *stream, void *bl, char *buf, int mode, size_t size)
 {
+    int r;
     if (buf)
         filc_check(bl, buf, size, 1);
-    return setvbuf(stream, buf, mode, size);
+    r = setvbuf(stream, buf, mode, size);
+    if (r == 0)
+        filc_stdio_pin(stream, buf ? bl : NULL);
+    return r;
 }
 
 void filc_setbuf(FILE *stream, void *bl, char *buf)
@@ -3955,6 +4721,7 @@ void filc_setbuf(FILE *stream, void *bl, char *buf)
     if (buf)
         filc_check(bl, buf, BUFSIZ, 1);
     setbuf(stream, buf);
+    filc_stdio_pin(stream, buf ? bl : NULL);
 }
 
 int filc_close(int fd)
@@ -4003,10 +4770,12 @@ static size_t filc_writable_tail(void *lower, void *ptr)
 
 /* Direct printf records each argument, then filc_fmt_end walks the
  * format. vprintf, vdprintf, and an indirect printf walk the same conversions.
- * A pointer argument takes one capability. An int, a double, or a
- * long double only advances the va_list, so the next %s stays aligned.
- * A positional %N$ stops the walk after the format has been strlen'd.
- * A dynamic .* precision requires a terminator instead of a byte count. */
+ * A pointer argument takes one capability. An int is recorded so a
+ * .* precision and a positional %N$ can name it. A double or a long
+ * double only advances the argument list, so the next %s stays aligned.
+ * A positional %N$ in vprintf or an indirect printf is replayed from
+ * the va_list offsets. The pointer is matched to a capability that
+ * frame passed. A direct call uses the recorded argument. */
 #define FILC_FMT_MAX 64
 static __thread int filc_fmt_n;
 static __thread const char *filc_fmt_s;
@@ -4014,6 +4783,8 @@ static __thread const char *filc_fmt_s;
  * The buffer is thread-local and freed when the walk finishes. */
 static __thread char *filc_fmt_narrow;
 static __thread char filc_fmt_isptr[FILC_FMT_MAX];
+static __thread char filc_fmt_isint[FILC_FMT_MAX];
+static __thread int filc_fmt_intv[FILC_FMT_MAX];
 static __thread void *filc_fmt_cap[FILC_FMT_MAX];
 static __thread void *filc_fmt_arg[FILC_FMT_MAX];
 
@@ -4061,6 +4832,7 @@ void filc_fmt_ptr(void *lower, void *p)
     if (filc_fmt_n >= FILC_FMT_MAX)
         filc_panic("out of bounds");
     filc_fmt_isptr[filc_fmt_n] = 1;
+    filc_fmt_isint[filc_fmt_n] = 0;
     filc_fmt_cap[filc_fmt_n] = lower;
     filc_fmt_arg[filc_fmt_n] = p;
     filc_fmt_n++;
@@ -4071,6 +4843,19 @@ void filc_fmt_skip(void)
     if (filc_fmt_n >= FILC_FMT_MAX)
         filc_panic("out of bounds");
     filc_fmt_isptr[filc_fmt_n] = 0;
+    filc_fmt_isint[filc_fmt_n] = 0;
+    filc_fmt_cap[filc_fmt_n] = NULL;
+    filc_fmt_arg[filc_fmt_n] = NULL;
+    filc_fmt_n++;
+}
+
+void filc_fmt_int(int v)
+{
+    if (filc_fmt_n >= FILC_FMT_MAX)
+        filc_panic("out of bounds");
+    filc_fmt_isptr[filc_fmt_n] = 0;
+    filc_fmt_isint[filc_fmt_n] = 1;
+    filc_fmt_intv[filc_fmt_n] = v;
     filc_fmt_cap[filc_fmt_n] = NULL;
     filc_fmt_arg[filc_fmt_n] = NULL;
     filc_fmt_n++;
@@ -4153,9 +4938,586 @@ static void filc_fmt_consume(int mode, va_list *ap, int *ai, int *cap_i,
     }
 }
 
-/* mode 0: arguments recorded by filc_fmt_ptr. mode 1: this call's
- * frame (indirect printf). mode 2: the va_list save area bound at
- * va_start (vprintf and a wrapper that passes the va_list on). */
+static int filc_fmt_is_spec(char c)
+{
+    switch (c) {
+    case 'd': case 'i': case 'u': case 'o': case 'x': case 'X':
+    case 'f': case 'F': case 'e': case 'E': case 'g': case 'G':
+    case 'a': case 'A': case 'c': case 's': case 'p': case 'n':
+    case 'm': case 'S': case 'C':
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* 1 if any conversion uses N$ or *N$. A literal $ outside % does not. */
+static int filc_fmt_has_pos(const char *s)
+{
+    if (!s)
+        return 0;
+    while (*s) {
+        if (*s != '%') {
+            s++;
+            continue;
+        }
+        s++;
+        if (*s == '%') {
+            s++;
+            continue;
+        }
+        while (*s && !filc_fmt_is_spec(*s)) {
+            if (*s == '$')
+                return 1;
+            if (*s == '%')
+                break;
+            s++;
+        }
+        if (*s && filc_fmt_is_spec(*s))
+            s++;
+    }
+    return 0;
+}
+
+/* N$ at *ps. N is 1..FILC_FMT_MAX. *idx is N-1. */
+static int filc_fmt_dollar(const char **ps, int *idx)
+{
+    const char *s;
+    int n;
+
+    s = *ps;
+    if (*s < '1' || *s > '9')
+        return 0;
+    n = 0;
+    while (*s >= '0' && *s <= '9') {
+        n = n * 10 + (*s - '0');
+        if (n > FILC_FMT_MAX)
+            filc_panic("out of bounds");
+        s++;
+    }
+    if (*s != '$')
+        return 0;
+    *idx = n - 1;
+    *ps = s + 1;
+    return 1;
+}
+
+static int filc_fmt_len(const char **ps)
+{
+    const char *s;
+    int len;
+
+    s = *ps;
+    len = 0;
+    if (*s == 'h') {
+        s++;
+        if (*s == 'h') {
+            len = 1;
+            s++;
+        } else {
+            len = 2;
+        }
+    } else if (*s == 'l') {
+        s++;
+        if (*s == 'l') {
+            len = 4;
+            s++;
+        } else {
+            len = 3;
+        }
+    } else if (*s == 'z' || *s == 't' || *s == 'j' || *s == 'q') {
+        len = (*s == 'q') ? 4 : 5;
+        s++;
+    } else if (*s == 'L') {
+        len = 6;
+        s++;
+    }
+    *ps = s;
+    return len;
+}
+
+static size_t filc_fmt_nsize(int len)
+{
+    if (len == 1)
+        return 1;
+    if (len == 2)
+        return 2;
+    if (len >= 3)
+        return 8;
+    return 4;
+}
+
+static int filc_fmt_int_at(int idx)
+{
+    if (idx < 0 || idx >= filc_fmt_n || !filc_fmt_isint[idx])
+        filc_panic("out of bounds");
+    return filc_fmt_intv[idx];
+}
+
+static int filc_fmt_next_int(int *ai)
+{
+    return filc_fmt_int_at(filc_fmt_take(ai));
+}
+
+static int filc_fmt_va_int(va_list *ap)
+{
+    void *p;
+
+    p = filc_fmt_advance(0, ap, (void *)*ap);
+    return (int)(intptr_t)p;
+}
+
+static int filc_fmt_read_int(int mode, va_list *ap, int *ai)
+{
+    if (mode == 0)
+        return filc_fmt_next_int(ai);
+    return filc_fmt_va_int(ap);
+}
+
+/* A negative precision is the same as omitting it. */
+static void filc_fmt_set_prec(int v, int *has_prec, long *prec)
+{
+    if (v < 0) {
+        *has_prec = 0;
+        *prec = 0;
+        return;
+    }
+    *has_prec = 1;
+    *prec = (long)v;
+}
+
+static void filc_fmt_digits(const char **ps, int *has_prec, long *prec)
+{
+    const char *s;
+
+    s = *ps;
+    *has_prec = 1;
+    *prec = 0;
+    while (*s >= '0' && *s <= '9') {
+        if (*prec <= 1000000000L)
+            *prec = *prec * 10 + (long)(*s - '0');
+        if (*prec > 1000000000L)
+            *has_prec = 0;
+        s++;
+    }
+    *ps = s;
+}
+
+static void filc_fmt_string(void *cap, void *p, int wide, int has_prec,
+    long prec)
+{
+    if (!has_prec) {
+        if (wide)
+            filc_wcslen(cap, (const wchar_t *)p);
+        else
+            filc_strlen(cap, (const char *)p);
+        return;
+    }
+    if (wide)
+        filc_check(cap, p, filc_wbytes((size_t)prec), 0);
+    else
+        filc_check(cap, p, (size_t)prec, 0);
+}
+
+static void filc_fmt_arg_ptr(int idx, void **cap, void **p)
+{
+    if (idx < 0 || idx >= filc_fmt_n || !filc_fmt_isptr[idx])
+        filc_panic("out of bounds");
+    *cap = filc_fmt_cap[idx];
+    *p = filc_fmt_arg[idx];
+}
+
+/* Direct printf. Every conversion may name its argument with N$.
+ * A * or .* without N$ still consumes the next recorded argument. */
+static void filc_fmt_walk_pos0(void)
+{
+    const char *s;
+    int ai;
+
+    s = filc_fmt_s;
+    ai = 0;
+    while (s && *s) {
+        int data, data_set, warg, parg, v, len, has_prec, wide;
+        long prec;
+        char spec;
+        void *cap, *p;
+
+        if (*s != '%') {
+            s++;
+            continue;
+        }
+        s++;
+        if (*s == '%') {
+            s++;
+            continue;
+        }
+        data = -1;
+        data_set = filc_fmt_dollar(&s, &data);
+        while (*s == '-' || *s == '+' || *s == ' ' || *s == '#'
+            || *s == '0' || *s == '\'' || *s == 'I')
+            s++;
+        if (*s == '*') {
+            s++;
+            if (filc_fmt_dollar(&s, &warg))
+                (void)filc_fmt_int_at(warg);
+            else
+                (void)filc_fmt_next_int(&ai);
+        } else {
+            while (*s >= '0' && *s <= '9')
+                s++;
+        }
+        has_prec = 0;
+        prec = 0;
+        if (*s == '.') {
+            s++;
+            if (*s == '*') {
+                s++;
+                if (filc_fmt_dollar(&s, &parg))
+                    v = filc_fmt_int_at(parg);
+                else
+                    v = filc_fmt_next_int(&ai);
+                filc_fmt_set_prec(v, &has_prec, &prec);
+            } else {
+                filc_fmt_digits(&s, &has_prec, &prec);
+            }
+        }
+        len = filc_fmt_len(&s);
+        spec = *s;
+        if (spec == 0)
+            filc_panic("out of bounds");
+        s++;
+        if (spec == 'm')
+            continue;
+        if (!data_set)
+            data = filc_fmt_take(&ai);
+        wide = (spec == 'S') || (spec == 's' && len == 3);
+        if (spec == 's' || spec == 'S') {
+            filc_fmt_arg_ptr(data, &cap, &p);
+            filc_fmt_string(cap, p, wide, has_prec, prec);
+            continue;
+        }
+        if (spec == 'n') {
+            filc_fmt_arg_ptr(data, &cap, &p);
+            filc_check(cap, p, filc_fmt_nsize(len), 1);
+            continue;
+        }
+        if (data < 0 || data >= filc_fmt_n)
+            filc_panic("out of bounds");
+    }
+}
+
+/* x86_64 SysV va_list, replayed from a copy of the offsets. The
+ * caller's va_list stays where glibc will read it. Class 0 is a
+ * general register, 1 a double, 2 a long double (memory). An
+ * argument the format never names is a general register. */
+struct filc_va_sim {
+    unsigned gp;
+    unsigned fp;
+    char *ov;
+    char *reg;
+};
+
+static void *filc_va_overflow(struct filc_va_sim *v, int size, int align)
+{
+    char *p;
+    unsigned long u, a;
+
+    if (!v->ov)
+        filc_panic("out of bounds");
+    size = (size + 7) & ~7;
+    align = (align + 7) & ~7;
+    p = v->ov + size;
+    a = (unsigned long)align;
+    u = (unsigned long)p;
+    u = (u + a - 1) & -a;
+    p += u - (unsigned long)p;
+    v->ov = p;
+    return p - size;
+}
+
+static void *filc_va_take_slot(struct filc_va_sim *v, int cls)
+{
+    if (cls == 2)
+        return filc_va_overflow(v, 16, 16);
+    if (cls == 1) {
+        if (v->fp < 48u + 128u) {
+            v->fp += 16;
+            if (!v->reg)
+                filc_panic("out of bounds");
+            return v->reg + v->fp - 16;
+        }
+        return filc_va_overflow(v, 8, 8);
+    }
+    if (v->gp + 8 <= 48) {
+        v->gp += 8;
+        if (!v->reg)
+            filc_panic("out of bounds");
+        return v->reg + v->gp - 8;
+    }
+    return filc_va_overflow(v, 8, 8);
+}
+
+static void *filc_va_arg_slot(const struct filc_va_sim *base,
+    const signed char *cls, int idx)
+{
+    struct filc_va_sim v;
+    int i;
+    void *slot;
+
+    if (idx < 0 || idx >= FILC_FMT_MAX)
+        filc_panic("out of bounds");
+    v = *base;
+    slot = NULL;
+    for (i = 0; i <= idx; i++) {
+        int c;
+        c = cls[i];
+        if (c < 0)
+            c = 0;
+        slot = filc_va_take_slot(&v, c);
+    }
+    return slot;
+}
+
+static int filc_va_slot_int(void *slot)
+{
+    int v;
+    memcpy(&v, slot, sizeof v);
+    return v;
+}
+
+static void *filc_va_slot_ptr(void *slot)
+{
+    void *p;
+    memcpy(&p, slot, sizeof p);
+    return p;
+}
+
+/* The pointer value has to land in a capability this frame passed.
+ * The smallest such object wins. A forged pointer into one of those
+ * objects is accepted: the alternative is leaving glibc unchecked. */
+static void *filc_fmt_cap_hold(int depth, int from, void *p)
+{
+    int i;
+    void *best;
+    size_t best_sz;
+    uintptr_t addr;
+
+    if (!p)
+        filc_panic("null capability");
+    if (depth < 0 || depth >= call_depth)
+        filc_panic("out of bounds");
+    if (from < 0)
+        from = 0;
+    best = NULL;
+    best_sz = ~(size_t)0;
+    addr = (uintptr_t)p;
+    filc_lock();
+    for (i = from; i < FILC_MAX_PTR_ARGS; i++) {
+        void *cap;
+        filc_object *o;
+        uintptr_t lo, hi;
+        cap = call_caps[depth][i];
+        if (!cap)
+            continue;
+        o = filc_lookup(cap);
+        if (!o || (o->flags & FILC_FREE) || o->size == 0)
+            continue;
+        lo = (uintptr_t)o->payload;
+        hi = lo + o->size;
+        if (addr >= lo && addr < hi && o->size < best_sz) {
+            best = cap;
+            best_sz = o->size;
+        }
+    }
+    filc_unlock();
+    if (!best)
+        filc_panic("out of bounds");
+    return best;
+}
+
+static int filc_fmt_spec_cls(char spec, int len)
+{
+    if (spec == 'a' || spec == 'A' || spec == 'e' || spec == 'E'
+        || spec == 'f' || spec == 'F' || spec == 'g' || spec == 'G')
+        return (len == 6) ? 2 : 1;
+    return 0;
+}
+
+static void filc_fmt_cls_set(signed char *cls, int idx, int c)
+{
+    if (idx < 0 || idx >= FILC_FMT_MAX)
+        filc_panic("out of bounds");
+    if (cls[idx] >= 0 && cls[idx] != (signed char)c)
+        filc_panic("unchecked printf");
+    cls[idx] = (signed char)c;
+}
+
+static int filc_fmt_seq_idx(int *ai)
+{
+    int i;
+    i = *ai;
+    if (i < 0 || i >= FILC_FMT_MAX)
+        filc_panic("out of bounds");
+    *ai = i + 1;
+    return i;
+}
+
+/* Mode 1 reads this call's frame, starting at the first variadic
+ * pointer. Mode 2 reads the frame va_start bound to the save area.
+ * Pass 0 only records classes. Pass 1 checks %s, %S, and %n. A
+ * later %f has to classify its argument before an earlier %s is
+ * located, so the two passes cannot be one walk. */
+static void filc_fmt_pos_va_pass(const struct filc_va_sim *base,
+    signed char *cls, int pass, int depth, int from)
+{
+    const char *s;
+    int ai;
+
+    s = filc_fmt_s;
+    ai = 0;
+    while (s && *s) {
+        int data, data_set, arg, v, len, has_prec, wide;
+        long prec;
+        char spec;
+        void *slot, *cap, *p;
+
+        if (*s != '%') {
+            s++;
+            continue;
+        }
+        s++;
+        if (*s == '%') {
+            s++;
+            continue;
+        }
+        data = -1;
+        data_set = filc_fmt_dollar(&s, &data);
+        while (*s == '-' || *s == '+' || *s == ' ' || *s == '#'
+            || *s == '0' || *s == '\'' || *s == 'I')
+            s++;
+        if (*s == '*') {
+            s++;
+            if (!filc_fmt_dollar(&s, &arg))
+                arg = filc_fmt_seq_idx(&ai);
+            if (pass == 0)
+                filc_fmt_cls_set(cls, arg, 0);
+        } else {
+            while (*s >= '0' && *s <= '9')
+                s++;
+        }
+        has_prec = 0;
+        prec = 0;
+        if (*s == '.') {
+            s++;
+            if (*s == '*') {
+                s++;
+                if (!filc_fmt_dollar(&s, &arg))
+                    arg = filc_fmt_seq_idx(&ai);
+                if (pass == 0)
+                    filc_fmt_cls_set(cls, arg, 0);
+                else {
+                    slot = filc_va_arg_slot(base, cls, arg);
+                    v = filc_va_slot_int(slot);
+                    filc_fmt_set_prec(v, &has_prec, &prec);
+                }
+            } else {
+                filc_fmt_digits(&s, &has_prec, &prec);
+            }
+        }
+        len = filc_fmt_len(&s);
+        spec = *s;
+        if (spec == 0)
+            filc_panic("out of bounds");
+        s++;
+        if (spec == 'm')
+            continue;
+        if (!data_set)
+            data = filc_fmt_seq_idx(&ai);
+        if (pass == 0) {
+            filc_fmt_cls_set(cls, data, filc_fmt_spec_cls(spec, len));
+            continue;
+        }
+        wide = (spec == 'S') || (spec == 's' && len == 3);
+        if (spec != 's' && spec != 'S' && spec != 'n')
+            continue;
+        slot = filc_va_arg_slot(base, cls, data);
+        p = filc_va_slot_ptr(slot);
+        cap = filc_fmt_cap_hold(depth, from, p);
+        if (spec == 'n')
+            filc_check(cap, p, filc_fmt_nsize(len), 1);
+        else
+            filc_fmt_string(cap, p, wide, has_prec, prec);
+    }
+}
+
+static int filc_fmt_va_frame(int mode, int cap_i, void *save, int *from)
+{
+    int i;
+    if (mode == 1) {
+        if (call_depth <= 0)
+            filc_panic("out of bounds");
+        *from = cap_i;
+        return call_depth - 1;
+    }
+    if (!save)
+        filc_panic("out of bounds");
+    for (i = 0; i < filc_va_nbinds; i++) {
+        int depth;
+        if (filc_va_binds[i].save != save)
+            continue;
+        depth = filc_va_binds[i].depth;
+        if (depth < 0 || depth >= call_depth)
+            filc_panic("out of bounds");
+        *from = call_va_idx[depth];
+        return depth;
+    }
+    filc_panic("out of bounds");
+    return -1;
+}
+
+static void filc_va_sim_load(struct filc_va_sim *v, va_list *ap)
+{
+    char *b;
+    if (!ap)
+        filc_panic("out of bounds");
+    b = (char *)*ap;
+    v->gp = *(unsigned *)(b + 0);
+    v->fp = *(unsigned *)(b + 4);
+    v->ov = *(char **)(b + 8);
+    v->reg = *(char **)(b + 16);
+}
+
+static void filc_fmt_walk_pos_va(int mode, va_list *ap, int cap_i, void *save)
+{
+    struct filc_va_sim base;
+    signed char cls[FILC_FMT_MAX];
+    int depth, from, i;
+
+#if !defined(__x86_64__)
+    (void)mode;
+    (void)ap;
+    (void)cap_i;
+    (void)save;
+    (void)base;
+    (void)cls;
+    (void)depth;
+    (void)from;
+    (void)i;
+    filc_panic("out of bounds");
+#else
+    for (i = 0; i < FILC_FMT_MAX; i++)
+        cls[i] = -1;
+    filc_va_sim_load(&base, ap);
+    depth = filc_fmt_va_frame(mode, cap_i, save, &from);
+    filc_fmt_pos_va_pass(&base, cls, 0, depth, from);
+    filc_fmt_pos_va_pass(&base, cls, 1, depth, from);
+#endif
+}
+
+/* mode 0: arguments recorded by filc_fmt_ptr and filc_fmt_int.
+ * mode 1: this call's frame (indirect printf). mode 2: the va_list
+ * save area bound at va_start (vprintf and a wrapper that passes
+ * the va_list on). */
 static void filc_fmt_walk(int mode, va_list *ap, int cap_i, void *save)
 {
     const char *s;
@@ -4167,11 +5529,18 @@ static void filc_fmt_walk(int mode, va_list *ap, int cap_i, void *save)
         filc_fmt_drop();
         return;
     }
+    if (filc_fmt_has_pos(s)) {
+        if (mode == 0)
+            filc_fmt_walk_pos0();
+        else
+            filc_fmt_walk_pos_va(mode, ap, cap_i, save);
+        filc_fmt_drop();
+        return;
+    }
     while (*s) {
-        int star_prec, has_prec, len, cls, want;
+        int has_prec, len, cls, want;
         long prec;
         char spec;
-        size_t sz;
         void *cap, *p;
 
         if (*s != '%') {
@@ -4186,8 +5555,13 @@ static void filc_fmt_walk(int mode, va_list *ap, int cap_i, void *save)
         while (*s == '-' || *s == '+' || *s == ' ' || *s == '#'
             || *s == '0' || *s == '\'' || *s == 'I')
             s++;
-        /* Positional conversions are not walked. The format is in bounds. */
+        /* has_pos already walked a format that contains $. A $ that
+         * still reaches here was not claimed. A direct call panics.
+         * vprintf and an indirect printf stop, so a terminated string
+         * in that missed form still prints. */
         if (filc_fmt_pos(s)) {
+            if (mode == 0)
+                filc_panic("unchecked printf");
             filc_fmt_drop();
             return;
         }
@@ -4198,28 +5572,22 @@ static void filc_fmt_walk(int mode, va_list *ap, int cap_i, void *save)
             while (*s >= '0' && *s <= '9')
                 s++;
         }
-        star_prec = 0;
         has_prec = 0;
         prec = 0;
         if (*s == '.') {
             s++;
             if (filc_fmt_pos(s)) {
+                if (mode == 0)
+                    filc_panic("unchecked printf");
                 filc_fmt_drop();
                 return;
             }
             if (*s == '*') {
-                filc_fmt_consume(mode, ap, &ai, &cap_i, save, 0, 0, NULL, NULL);
-                star_prec = 1;
+                filc_fmt_set_prec(filc_fmt_read_int(mode, ap, &ai),
+                    &has_prec, &prec);
                 s++;
             } else {
-                has_prec = 1;
-                while (*s >= '0' && *s <= '9') {
-                    if (prec <= 1000000000L)
-                        prec = prec * 10 + (long)(*s - '0');
-                    if (prec > 1000000000L)
-                        has_prec = 0;
-                    s++;
-                }
+                filc_fmt_digits(&s, &has_prec, &prec);
             }
         }
         len = 0;
@@ -4262,26 +5630,12 @@ static void filc_fmt_walk(int mode, va_list *ap, int cap_i, void *save)
             cap = NULL;
             p = NULL;
             filc_fmt_consume(mode, ap, &ai, &cap_i, save, 0, want, &cap, &p);
-            if (spec == 'S' || (spec == 's' && len == 3)) {
-                if (star_prec || !has_prec)
-                    filc_wcslen(cap, (const wchar_t *)p);
-                else
-                    filc_check(cap, p, filc_wbytes((size_t)prec), 0);
-            } else if (spec == 's') {
-                if (star_prec || !has_prec)
-                    filc_strlen(cap, (const char *)p);
-                else
-                    filc_check(cap, p, (size_t)prec, 0);
-            } else if (spec == 'n') {
-                sz = 4;
-                if (len == 1)
-                    sz = 1;
-                else if (len == 2)
-                    sz = 2;
-                else if (len >= 3)
-                    sz = 8;
-                filc_check(cap, p, sz, 1);
-            }
+            if (spec == 'S' || (spec == 's' && len == 3))
+                filc_fmt_string(cap, p, 1, has_prec, prec);
+            else if (spec == 's')
+                filc_fmt_string(cap, p, 0, has_prec, prec);
+            else if (spec == 'n')
+                filc_check(cap, p, filc_fmt_nsize(len), 1);
             continue;
         }
         cls = 0;
@@ -4894,6 +6248,29 @@ int filc_strncasecmp(void *al, const char *a, void *bl, const char *b, size_t n)
     return strncasecmp(a, b, n);
 }
 
+/* Locale stays opaque bits and is not a filc object. glibc's
+ * strcasecmp_l dereferences the locale, so LC_GLOBAL_LOCALE is
+ * the plain global-locale call instead. */
+int filc_strcasecmp_l(void *al, const char *a, void *bl, const char *b,
+    locale_t loc)
+{
+    filc_strlen(al, a);
+    filc_strlen(bl, b);
+    if (loc == LC_GLOBAL_LOCALE)
+        return strcasecmp(a, b);
+    return strcasecmp_l(a, b, loc);
+}
+
+int filc_strncasecmp_l(void *al, const char *a, void *bl, const char *b,
+    size_t n, locale_t loc)
+{
+    filc_strnlen(al, a, n);
+    filc_strnlen(bl, b, n);
+    if (loc == LC_GLOBAL_LOCALE)
+        return strncasecmp(a, b, n);
+    return strncasecmp_l(a, b, n, loc);
+}
+
 /* A hit may be interior. The capability stays the haystack. */
 char *filc_strcasestr(void *hl, const char *h, void *nl, const char *n)
 {
@@ -4946,6 +6323,13 @@ int filc_fstat(void *bl, int fd, struct stat *buf)
 static void *ent_malloc(size_t n)
 {
     void *p = filc_malloc(n);
+    filc_set_ret(p);
+    return p;
+}
+
+static void *ent_aligned_alloc(size_t align, size_t size)
+{
+    void *p = filc_aligned_alloc(align, size);
     filc_set_ret(p);
     return p;
 }
@@ -5344,6 +6728,48 @@ static char *ent_strsep(char **stringp, const char *delim)
 static ssize_t ent_read(int fd, void *buf, size_t n)
 {
     return filc_read(filc_call_get(0), fd, buf, n);
+}
+
+static ssize_t ent_readlink(const char *path, char *buf, size_t bufsiz)
+{
+    return filc_readlink(filc_call_get(0), path, filc_call_get(1), buf, bufsiz);
+}
+
+static ssize_t ent_readlinkat(int dirfd, const char *path, char *buf,
+    size_t bufsiz)
+{
+    return filc_readlinkat(dirfd, filc_call_get(0), path, filc_call_get(1),
+        buf, bufsiz);
+}
+
+static int ent_gethostname(char *name, size_t len)
+{
+    return filc_gethostname(filc_call_get(0), name, len);
+}
+
+static int ent_getdomainname(char *name, size_t len)
+{
+    return filc_getdomainname(filc_call_get(0), name, len);
+}
+
+static size_t ent_confstr(int name, char *buf, size_t len)
+{
+    return filc_confstr(name, filc_call_get(0), buf, len);
+}
+
+static int ent_uname(struct utsname *buf)
+{
+    return filc_uname(filc_call_get(0), buf);
+}
+
+static int ent_sysinfo(struct sysinfo *info)
+{
+    return filc_sysinfo(filc_call_get(0), info);
+}
+
+static int ent_getrusage(int who, struct rusage *usage)
+{
+    return filc_getrusage(who, filc_call_get(0), usage);
 }
 
 static ssize_t ent_write(int fd, const void *buf, size_t n)
@@ -5921,6 +7347,16 @@ static wint_t ent_towupper(wint_t wc)
     return filc_towupper(wc);
 }
 
+static wint_t ent_towlower_l(wint_t wc, locale_t loc)
+{
+    return filc_towlower_l(wc, loc);
+}
+
+static wint_t ent_towupper_l(wint_t wc, locale_t loc)
+{
+    return filc_towupper_l(wc, loc);
+}
+
 static int ent_iswalnum(wint_t wc) { return filc_iswalnum(wc); }
 static int ent_iswalpha(wint_t wc) { return filc_iswalpha(wc); }
 static int ent_iswcntrl(wint_t wc) { return filc_iswcntrl(wc); }
@@ -5933,6 +7369,54 @@ static int ent_iswspace(wint_t wc) { return filc_iswspace(wc); }
 static int ent_iswupper(wint_t wc) { return filc_iswupper(wc); }
 static int ent_iswxdigit(wint_t wc) { return filc_iswxdigit(wc); }
 static int ent_iswblank(wint_t wc) { return filc_iswblank(wc); }
+static int ent_iswalnum_l(wint_t wc, locale_t loc)
+{
+    return filc_iswalnum_l(wc, loc);
+}
+static int ent_iswalpha_l(wint_t wc, locale_t loc)
+{
+    return filc_iswalpha_l(wc, loc);
+}
+static int ent_iswcntrl_l(wint_t wc, locale_t loc)
+{
+    return filc_iswcntrl_l(wc, loc);
+}
+static int ent_iswdigit_l(wint_t wc, locale_t loc)
+{
+    return filc_iswdigit_l(wc, loc);
+}
+static int ent_iswgraph_l(wint_t wc, locale_t loc)
+{
+    return filc_iswgraph_l(wc, loc);
+}
+static int ent_iswlower_l(wint_t wc, locale_t loc)
+{
+    return filc_iswlower_l(wc, loc);
+}
+static int ent_iswprint_l(wint_t wc, locale_t loc)
+{
+    return filc_iswprint_l(wc, loc);
+}
+static int ent_iswpunct_l(wint_t wc, locale_t loc)
+{
+    return filc_iswpunct_l(wc, loc);
+}
+static int ent_iswspace_l(wint_t wc, locale_t loc)
+{
+    return filc_iswspace_l(wc, loc);
+}
+static int ent_iswupper_l(wint_t wc, locale_t loc)
+{
+    return filc_iswupper_l(wc, loc);
+}
+static int ent_iswxdigit_l(wint_t wc, locale_t loc)
+{
+    return filc_iswxdigit_l(wc, loc);
+}
+static int ent_iswblank_l(wint_t wc, locale_t loc)
+{
+    return filc_iswblank_l(wc, loc);
+}
 
 static wctype_t ent_wctype(const char *property)
 {
@@ -5952,6 +7436,26 @@ static wctrans_t ent_wctrans(const char *property)
 static wint_t ent_towctrans(wint_t wc, wctrans_t desc)
 {
     return filc_towctrans(wc, desc);
+}
+
+static wctype_t ent_wctype_l(const char *property, locale_t loc)
+{
+    return filc_wctype_l(filc_call_get(0), property, loc);
+}
+
+static int ent_iswctype_l(wint_t wc, wctype_t desc, locale_t loc)
+{
+    return filc_iswctype_l(wc, desc, loc);
+}
+
+static wctrans_t ent_wctrans_l(const char *property, locale_t loc)
+{
+    return filc_wctrans_l(filc_call_get(0), property, loc);
+}
+
+static wint_t ent_towctrans_l(wint_t wc, wctrans_t desc, locale_t loc)
+{
+    return filc_towctrans_l(wc, desc, loc);
 }
 
 static int ent_mblen(const char *s, size_t n)
@@ -5999,6 +7503,124 @@ static size_t ent_wcsxfrm(wchar_t *dest, const wchar_t *src, size_t n)
     return filc_wcsxfrm(filc_call_get(0), dest, filc_call_get(1), src, n);
 }
 
+static int ent_wcscoll_l(const wchar_t *a, const wchar_t *b, locale_t loc)
+{
+    return filc_wcscoll_l(filc_call_get(0), a, filc_call_get(1), b, loc);
+}
+
+static int ent_wcscasecmp_l(const wchar_t *a, const wchar_t *b, locale_t loc)
+{
+    return filc_wcscasecmp_l(filc_call_get(0), a, filc_call_get(1), b, loc);
+}
+
+static int ent_wcsncasecmp_l(const wchar_t *a, const wchar_t *b, size_t n,
+    locale_t loc)
+{
+    return filc_wcsncasecmp_l(filc_call_get(0), a, filc_call_get(1), b, n, loc);
+}
+
+static size_t ent_wcsxfrm_l(wchar_t *dest, const wchar_t *src, size_t n,
+    locale_t loc)
+{
+    return filc_wcsxfrm_l(filc_call_get(0), dest, filc_call_get(1), src, n, loc);
+}
+
+static size_t ent_wcsftime(wchar_t *s, size_t maxsize, const wchar_t *format,
+    const struct tm *tp)
+{
+    return filc_wcsftime(filc_call_get(0), s, maxsize, filc_call_get(1),
+        format, filc_call_get(2), tp);
+}
+
+static size_t ent_wcsftime_l(wchar_t *s, size_t maxsize, const wchar_t *format,
+    const struct tm *tp, locale_t loc)
+{
+    return filc_wcsftime_l(filc_call_get(0), s, maxsize, filc_call_get(1),
+        format, filc_call_get(2), tp, loc);
+}
+
+static size_t ent_strftime(char *s, size_t maxsize, const char *format,
+    const struct tm *tp)
+{
+    return filc_strftime(filc_call_get(0), s, maxsize, filc_call_get(1),
+        format, filc_call_get(2), tp);
+}
+
+static size_t ent_strftime_l(char *s, size_t maxsize, const char *format,
+    const struct tm *tp, locale_t loc)
+{
+    return filc_strftime_l(filc_call_get(0), s, maxsize, filc_call_get(1),
+        format, filc_call_get(2), tp, loc);
+}
+
+static char *ent_strptime(const char *s, const char *format, struct tm *tp)
+{
+    return filc_strptime(filc_call_get(0), s, filc_call_get(1), format,
+        filc_call_get(2), tp);
+}
+
+static char *ent_strptime_l(const char *s, const char *format, struct tm *tp,
+    locale_t loc)
+{
+    return filc_strptime_l(filc_call_get(0), s, filc_call_get(1), format,
+        filc_call_get(2), tp, loc);
+}
+
+static struct tm *ent_gmtime_r(const time_t *timer, struct tm *tp)
+{
+    return filc_gmtime_r(filc_call_get(0), timer, filc_call_get(1), tp);
+}
+
+static struct tm *ent_localtime_r(const time_t *timer, struct tm *tp)
+{
+    return filc_localtime_r(filc_call_get(0), timer, filc_call_get(1), tp);
+}
+
+static char *ent_asctime_r(const struct tm *tp, char *buf)
+{
+    return filc_asctime_r(filc_call_get(0), tp, filc_call_get(1), buf);
+}
+
+static char *ent_ctime_r(const time_t *timer, char *buf)
+{
+    return filc_ctime_r(filc_call_get(0), timer, filc_call_get(1), buf);
+}
+
+static struct tm *ent_gmtime(const time_t *timer)
+{
+    return filc_gmtime(filc_call_get(0), timer);
+}
+
+static struct tm *ent_localtime(const time_t *timer)
+{
+    return filc_localtime(filc_call_get(0), timer);
+}
+
+static char *ent_asctime(const struct tm *tp)
+{
+    return filc_asctime(filc_call_get(0), tp);
+}
+
+static char *ent_ctime(const time_t *timer)
+{
+    return filc_ctime(filc_call_get(0), timer);
+}
+
+static time_t ent_mktime(struct tm *tp)
+{
+    return filc_mktime(filc_call_get(0), tp);
+}
+
+static time_t ent_time(time_t *timer)
+{
+    return filc_time(filc_call_get(0), timer);
+}
+
+static time_t ent_timegm(struct tm *tp)
+{
+    return filc_timegm(filc_call_get(0), tp);
+}
+
 static int ent_strcoll(const char *a, const char *b)
 {
     return filc_strcoll(filc_call_get(0), a, filc_call_get(1), b);
@@ -6007,6 +7629,18 @@ static int ent_strcoll(const char *a, const char *b)
 static size_t ent_strxfrm(char *dest, const char *src, size_t n)
 {
     return filc_strxfrm(filc_call_get(0), dest, filc_call_get(1), src, n);
+}
+
+static int ent_strcoll_l(const char *a, const char *b, locale_t loc)
+{
+    return filc_strcoll_l(filc_call_get(0), a, filc_call_get(1), b, loc);
+}
+
+static size_t ent_strxfrm_l(char *dest, const char *src, size_t n,
+    locale_t loc)
+{
+    return filc_strxfrm_l(filc_call_get(0), dest, filc_call_get(1), src, n,
+        loc);
 }
 
 static void ent_perror(const char *s)
@@ -6039,6 +7673,17 @@ static int ent_strcasecmp(const char *a, const char *b)
 static int ent_strncasecmp(const char *a, const char *b, size_t n)
 {
     return filc_strncasecmp(filc_call_get(0), a, filc_call_get(1), b, n);
+}
+
+static int ent_strcasecmp_l(const char *a, const char *b, locale_t loc)
+{
+    return filc_strcasecmp_l(filc_call_get(0), a, filc_call_get(1), b, loc);
+}
+
+static int ent_strncasecmp_l(const char *a, const char *b, size_t n,
+    locale_t loc)
+{
+    return filc_strncasecmp_l(filc_call_get(0), a, filc_call_get(1), b, n, loc);
 }
 
 static char *ent_strcasestr(const char *h, const char *n)
@@ -6260,6 +7905,204 @@ long double filc_wcstold(void *sl, const wchar_t *s, void *el, wchar_t **end)
     return v;
 }
 
+/* Locale stays opaque bits. glibc's wide *_l scans dereference it,
+ * so LC_GLOBAL_LOCALE is the plain global-locale call instead. */
+long filc_wcstol_l(void *sl, const wchar_t *s, void *el, wchar_t **end,
+    int base, locale_t loc)
+{
+    wchar_t *e = NULL;
+    long v;
+    filc_wcslen(sl, s);
+    if (loc == LC_GLOBAL_LOCALE)
+        v = wcstol(s, end ? &e : NULL, base);
+    else
+        v = wcstol_l(s, end ? &e : NULL, base, loc);
+    filc_set_wend(sl, e, el, end);
+    return v;
+}
+
+long long filc_wcstoll_l(void *sl, const wchar_t *s, void *el, wchar_t **end,
+    int base, locale_t loc)
+{
+    wchar_t *e = NULL;
+    long long v;
+    filc_wcslen(sl, s);
+    if (loc == LC_GLOBAL_LOCALE)
+        v = wcstoll(s, end ? &e : NULL, base);
+    else
+        v = wcstoll_l(s, end ? &e : NULL, base, loc);
+    filc_set_wend(sl, e, el, end);
+    return v;
+}
+
+unsigned long filc_wcstoul_l(void *sl, const wchar_t *s, void *el, wchar_t **end,
+    int base, locale_t loc)
+{
+    wchar_t *e = NULL;
+    unsigned long v;
+    filc_wcslen(sl, s);
+    if (loc == LC_GLOBAL_LOCALE)
+        v = wcstoul(s, end ? &e : NULL, base);
+    else
+        v = wcstoul_l(s, end ? &e : NULL, base, loc);
+    filc_set_wend(sl, e, el, end);
+    return v;
+}
+
+unsigned long long filc_wcstoull_l(void *sl, const wchar_t *s, void *el,
+    wchar_t **end, int base, locale_t loc)
+{
+    wchar_t *e = NULL;
+    unsigned long long v;
+    filc_wcslen(sl, s);
+    if (loc == LC_GLOBAL_LOCALE)
+        v = wcstoull(s, end ? &e : NULL, base);
+    else
+        v = wcstoull_l(s, end ? &e : NULL, base, loc);
+    filc_set_wend(sl, e, el, end);
+    return v;
+}
+
+float filc_wcstof_l(void *sl, const wchar_t *s, void *el, wchar_t **end,
+    locale_t loc)
+{
+    wchar_t *e = NULL;
+    float v;
+    filc_wcslen(sl, s);
+    if (loc == LC_GLOBAL_LOCALE)
+        v = wcstof(s, end ? &e : NULL);
+    else
+        v = wcstof_l(s, end ? &e : NULL, loc);
+    filc_set_wend(sl, e, el, end);
+    return v;
+}
+
+double filc_wcstod_l(void *sl, const wchar_t *s, void *el, wchar_t **end,
+    locale_t loc)
+{
+    wchar_t *e = NULL;
+    double v;
+    filc_wcslen(sl, s);
+    if (loc == LC_GLOBAL_LOCALE)
+        v = wcstod(s, end ? &e : NULL);
+    else
+        v = wcstod_l(s, end ? &e : NULL, loc);
+    filc_set_wend(sl, e, el, end);
+    return v;
+}
+
+long double filc_wcstold_l(void *sl, const wchar_t *s, void *el, wchar_t **end,
+    locale_t loc)
+{
+    wchar_t *e = NULL;
+    long double v;
+    filc_wcslen(sl, s);
+    if (loc == LC_GLOBAL_LOCALE)
+        v = wcstold(s, end ? &e : NULL);
+    else
+        v = wcstold_l(s, end ? &e : NULL, loc);
+    filc_set_wend(sl, e, el, end);
+    return v;
+}
+
+/* Locale stays opaque bits. glibc's byte *_l scans dereference it,
+ * so LC_GLOBAL_LOCALE is the plain global-locale call instead. */
+long filc_strtol_l(void *sl, const char *s, void *el, char **end, int base,
+    locale_t loc)
+{
+    char *e = NULL;
+    long v;
+    filc_strlen(sl, s);
+    if (loc == LC_GLOBAL_LOCALE)
+        v = strtol(s, end ? &e : NULL, base);
+    else
+        v = strtol_l(s, end ? &e : NULL, base, loc);
+    filc_set_end(sl, e, el, end);
+    return v;
+}
+
+long long filc_strtoll_l(void *sl, const char *s, void *el, char **end,
+    int base, locale_t loc)
+{
+    char *e = NULL;
+    long long v;
+    filc_strlen(sl, s);
+    if (loc == LC_GLOBAL_LOCALE)
+        v = strtoll(s, end ? &e : NULL, base);
+    else
+        v = strtoll_l(s, end ? &e : NULL, base, loc);
+    filc_set_end(sl, e, el, end);
+    return v;
+}
+
+unsigned long filc_strtoul_l(void *sl, const char *s, void *el, char **end,
+    int base, locale_t loc)
+{
+    char *e = NULL;
+    unsigned long v;
+    filc_strlen(sl, s);
+    if (loc == LC_GLOBAL_LOCALE)
+        v = strtoul(s, end ? &e : NULL, base);
+    else
+        v = strtoul_l(s, end ? &e : NULL, base, loc);
+    filc_set_end(sl, e, el, end);
+    return v;
+}
+
+unsigned long long filc_strtoull_l(void *sl, const char *s, void *el, char **end,
+    int base, locale_t loc)
+{
+    char *e = NULL;
+    unsigned long long v;
+    filc_strlen(sl, s);
+    if (loc == LC_GLOBAL_LOCALE)
+        v = strtoull(s, end ? &e : NULL, base);
+    else
+        v = strtoull_l(s, end ? &e : NULL, base, loc);
+    filc_set_end(sl, e, el, end);
+    return v;
+}
+
+float filc_strtof_l(void *sl, const char *s, void *el, char **end, locale_t loc)
+{
+    char *e = NULL;
+    float v;
+    filc_strlen(sl, s);
+    if (loc == LC_GLOBAL_LOCALE)
+        v = strtof(s, end ? &e : NULL);
+    else
+        v = strtof_l(s, end ? &e : NULL, loc);
+    filc_set_end(sl, e, el, end);
+    return v;
+}
+
+double filc_strtod_l(void *sl, const char *s, void *el, char **end, locale_t loc)
+{
+    char *e = NULL;
+    double v;
+    filc_strlen(sl, s);
+    if (loc == LC_GLOBAL_LOCALE)
+        v = strtod(s, end ? &e : NULL);
+    else
+        v = strtod_l(s, end ? &e : NULL, loc);
+    filc_set_end(sl, e, el, end);
+    return v;
+}
+
+long double filc_strtold_l(void *sl, const char *s, void *el, char **end,
+    locale_t loc)
+{
+    char *e = NULL;
+    long double v;
+    filc_strlen(sl, s);
+    if (loc == LC_GLOBAL_LOCALE)
+        v = strtold(s, end ? &e : NULL);
+    else
+        v = strtold_l(s, end ? &e : NULL, loc);
+    filc_set_end(sl, e, el, end);
+    return v;
+}
+
 intmax_t filc_strtoimax(void *sl, const char *s, void *el, char **end, int base)
 {
     char *e = NULL;
@@ -6392,6 +8235,81 @@ static long double ent_wcstold(const wchar_t *s, wchar_t **end)
     return filc_wcstold(filc_call_get(0), s, filc_call_get(1), end);
 }
 
+static long ent_wcstol_l(const wchar_t *s, wchar_t **end, int base, locale_t loc)
+{
+    return filc_wcstol_l(filc_call_get(0), s, filc_call_get(1), end, base, loc);
+}
+
+static long long ent_wcstoll_l(const wchar_t *s, wchar_t **end, int base,
+    locale_t loc)
+{
+    return filc_wcstoll_l(filc_call_get(0), s, filc_call_get(1), end, base, loc);
+}
+
+static unsigned long ent_wcstoul_l(const wchar_t *s, wchar_t **end, int base,
+    locale_t loc)
+{
+    return filc_wcstoul_l(filc_call_get(0), s, filc_call_get(1), end, base, loc);
+}
+
+static unsigned long long ent_wcstoull_l(const wchar_t *s, wchar_t **end,
+    int base, locale_t loc)
+{
+    return filc_wcstoull_l(filc_call_get(0), s, filc_call_get(1), end, base, loc);
+}
+
+static float ent_wcstof_l(const wchar_t *s, wchar_t **end, locale_t loc)
+{
+    return filc_wcstof_l(filc_call_get(0), s, filc_call_get(1), end, loc);
+}
+
+static double ent_wcstod_l(const wchar_t *s, wchar_t **end, locale_t loc)
+{
+    return filc_wcstod_l(filc_call_get(0), s, filc_call_get(1), end, loc);
+}
+
+static long double ent_wcstold_l(const wchar_t *s, wchar_t **end, locale_t loc)
+{
+    return filc_wcstold_l(filc_call_get(0), s, filc_call_get(1), end, loc);
+}
+
+static long ent_strtol_l(const char *s, char **end, int base, locale_t loc)
+{
+    return filc_strtol_l(filc_call_get(0), s, filc_call_get(1), end, base, loc);
+}
+
+static long long ent_strtoll_l(const char *s, char **end, int base, locale_t loc)
+{
+    return filc_strtoll_l(filc_call_get(0), s, filc_call_get(1), end, base, loc);
+}
+
+static unsigned long ent_strtoul_l(const char *s, char **end, int base,
+    locale_t loc)
+{
+    return filc_strtoul_l(filc_call_get(0), s, filc_call_get(1), end, base, loc);
+}
+
+static unsigned long long ent_strtoull_l(const char *s, char **end, int base,
+    locale_t loc)
+{
+    return filc_strtoull_l(filc_call_get(0), s, filc_call_get(1), end, base, loc);
+}
+
+static float ent_strtof_l(const char *s, char **end, locale_t loc)
+{
+    return filc_strtof_l(filc_call_get(0), s, filc_call_get(1), end, loc);
+}
+
+static double ent_strtod_l(const char *s, char **end, locale_t loc)
+{
+    return filc_strtod_l(filc_call_get(0), s, filc_call_get(1), end, loc);
+}
+
+static long double ent_strtold_l(const char *s, char **end, locale_t loc)
+{
+    return filc_strtold_l(filc_call_get(0), s, filc_call_get(1), end, loc);
+}
+
 static intmax_t ent_strtoimax(const char *s, char **end, int base)
 {
     return filc_strtoimax(filc_call_get(0), s, filc_call_get(1), end, base);
@@ -6415,6 +8333,11 @@ static uintmax_t ent_wcstoumax(const wchar_t *s, wchar_t **end, int base)
 static char *ent_getcwd(char *buf, size_t size)
 {
     return filc_getcwd(filc_call_get(0), buf, size);
+}
+
+static char *ent_realpath(const char *path, char *buf)
+{
+    return filc_realpath(filc_call_get(0), path, filc_call_get(1), buf);
 }
 
 static void *ent_dlopen(const char *file, int flags)
@@ -6621,12 +8544,28 @@ static int ent_vswscanf(const wchar_t *s, const wchar_t *fmt, va_list ap)
     return r;
 }
 
-#define FILC_NENTS 257
+#define FILC_NENTS 333
 static struct {
     const char *name;
     void *real;
     void *entry;
 } filc_ents[FILC_NENTS];
+
+/* Same names as filc_is_unchecked in tccgen.c. An indirect call still
+ * holds the libc address; filc_adapt sees it before the call. */
+static struct {
+    const char *name;
+    void *real;
+} filc_raw[] = {
+    { "fork", 0 }, { "vfork", 0 },
+    { "socket", 0 }, { "socketpair", 0 }, { "bind", 0 }, { "listen", 0 },
+    { "accept", 0 }, { "accept4", 0 }, { "connect", 0 },
+    { "send", 0 }, { "sendto", 0 }, { "sendmsg", 0 },
+    { "recv", 0 }, { "recvfrom", 0 }, { "recvmsg", 0 },
+    { "opendir", 0 }, { "fdopendir", 0 }, { "readdir", 0 },
+    { "readdir_r", 0 }, { "closedir", 0 },
+    { "seekdir", 0 }, { "telldir", 0 }, { "rewinddir", 0 }, { "scandir", 0 },
+};
 
 void *filc_adapt(void *fn)
 {
@@ -6636,6 +8575,10 @@ void *filc_adapt(void *fn)
     for (i = 0; i < FILC_NENTS; i++) {
         if (filc_ents[i].real && fn == filc_ents[i].real)
             return filc_ents[i].entry;
+    }
+    for (i = 0; i < (int)(sizeof filc_raw / sizeof filc_raw[0]); i++) {
+        if (filc_raw[i].real && fn == filc_raw[i].real)
+            filc_unchecked(filc_raw[i].name);
     }
     return fn;
 }
@@ -6900,6 +8843,84 @@ static void filc_resolve_libc(void)
     filc_ents[254].name = "strsignal"; filc_ents[254].entry = (void *)ent_strsignal;
     filc_ents[255].name = "strerror_r"; filc_ents[255].entry = (void *)ent_strerror_r;
     filc_ents[256].name = "strerror_l"; filc_ents[256].entry = (void *)ent_strerror_l;
+    filc_ents[257].name = "strcasecmp_l"; filc_ents[257].entry = (void *)ent_strcasecmp_l;
+    filc_ents[258].name = "strncasecmp_l"; filc_ents[258].entry = (void *)ent_strncasecmp_l;
+    filc_ents[259].name = "strcoll_l"; filc_ents[259].entry = (void *)ent_strcoll_l;
+    filc_ents[260].name = "strxfrm_l"; filc_ents[260].entry = (void *)ent_strxfrm_l;
+    filc_ents[261].name = "wcscoll_l"; filc_ents[261].entry = (void *)ent_wcscoll_l;
+    filc_ents[262].name = "wcsxfrm_l"; filc_ents[262].entry = (void *)ent_wcsxfrm_l;
+    filc_ents[263].name = "wcscasecmp_l"; filc_ents[263].entry = (void *)ent_wcscasecmp_l;
+    filc_ents[264].name = "wcsncasecmp_l"; filc_ents[264].entry = (void *)ent_wcsncasecmp_l;
+    filc_ents[265].name = "iswalnum_l"; filc_ents[265].entry = (void *)ent_iswalnum_l;
+    filc_ents[266].name = "iswalpha_l"; filc_ents[266].entry = (void *)ent_iswalpha_l;
+    filc_ents[267].name = "iswcntrl_l"; filc_ents[267].entry = (void *)ent_iswcntrl_l;
+    filc_ents[268].name = "iswdigit_l"; filc_ents[268].entry = (void *)ent_iswdigit_l;
+    filc_ents[269].name = "iswgraph_l"; filc_ents[269].entry = (void *)ent_iswgraph_l;
+    filc_ents[270].name = "iswlower_l"; filc_ents[270].entry = (void *)ent_iswlower_l;
+    filc_ents[271].name = "iswprint_l"; filc_ents[271].entry = (void *)ent_iswprint_l;
+    filc_ents[272].name = "iswpunct_l"; filc_ents[272].entry = (void *)ent_iswpunct_l;
+    filc_ents[273].name = "iswspace_l"; filc_ents[273].entry = (void *)ent_iswspace_l;
+    filc_ents[274].name = "iswupper_l"; filc_ents[274].entry = (void *)ent_iswupper_l;
+    filc_ents[275].name = "iswxdigit_l"; filc_ents[275].entry = (void *)ent_iswxdigit_l;
+    filc_ents[276].name = "iswblank_l"; filc_ents[276].entry = (void *)ent_iswblank_l;
+    filc_ents[277].name = "towlower_l"; filc_ents[277].entry = (void *)ent_towlower_l;
+    filc_ents[278].name = "towupper_l"; filc_ents[278].entry = (void *)ent_towupper_l;
+    filc_ents[279].name = "wctype_l"; filc_ents[279].entry = (void *)ent_wctype_l;
+    filc_ents[280].name = "iswctype_l"; filc_ents[280].entry = (void *)ent_iswctype_l;
+    filc_ents[281].name = "wctrans_l"; filc_ents[281].entry = (void *)ent_wctrans_l;
+    filc_ents[282].name = "towctrans_l"; filc_ents[282].entry = (void *)ent_towctrans_l;
+    filc_ents[283].name = "wcstol_l"; filc_ents[283].entry = (void *)ent_wcstol_l;
+    filc_ents[284].name = "wcstoll_l"; filc_ents[284].entry = (void *)ent_wcstoll_l;
+    filc_ents[285].name = "wcstoul_l"; filc_ents[285].entry = (void *)ent_wcstoul_l;
+    filc_ents[286].name = "wcstoull_l"; filc_ents[286].entry = (void *)ent_wcstoull_l;
+    filc_ents[287].name = "wcstof_l"; filc_ents[287].entry = (void *)ent_wcstof_l;
+    filc_ents[288].name = "wcstod_l"; filc_ents[288].entry = (void *)ent_wcstod_l;
+    filc_ents[289].name = "wcstold_l"; filc_ents[289].entry = (void *)ent_wcstold_l;
+    /* glibc's _GNU_SOURCE headers rename these to __isoc23_*. */
+    filc_ents[290].name = "__isoc23_wcstol_l"; filc_ents[290].entry = (void *)ent_wcstol_l;
+    filc_ents[291].name = "__isoc23_wcstoll_l"; filc_ents[291].entry = (void *)ent_wcstoll_l;
+    filc_ents[292].name = "__isoc23_wcstoul_l"; filc_ents[292].entry = (void *)ent_wcstoul_l;
+    filc_ents[293].name = "__isoc23_wcstoull_l"; filc_ents[293].entry = (void *)ent_wcstoull_l;
+    filc_ents[294].name = "wcsftime"; filc_ents[294].entry = (void *)ent_wcsftime;
+    filc_ents[295].name = "wcsftime_l"; filc_ents[295].entry = (void *)ent_wcsftime_l;
+    filc_ents[296].name = "strftime"; filc_ents[296].entry = (void *)ent_strftime;
+    filc_ents[297].name = "strftime_l"; filc_ents[297].entry = (void *)ent_strftime_l;
+    filc_ents[298].name = "strptime"; filc_ents[298].entry = (void *)ent_strptime;
+    filc_ents[299].name = "strptime_l"; filc_ents[299].entry = (void *)ent_strptime_l;
+    filc_ents[300].name = "strtol_l"; filc_ents[300].entry = (void *)ent_strtol_l;
+    filc_ents[301].name = "strtoll_l"; filc_ents[301].entry = (void *)ent_strtoll_l;
+    filc_ents[302].name = "strtoul_l"; filc_ents[302].entry = (void *)ent_strtoul_l;
+    filc_ents[303].name = "strtoull_l"; filc_ents[303].entry = (void *)ent_strtoull_l;
+    filc_ents[304].name = "strtof_l"; filc_ents[304].entry = (void *)ent_strtof_l;
+    filc_ents[305].name = "strtod_l"; filc_ents[305].entry = (void *)ent_strtod_l;
+    filc_ents[306].name = "strtold_l"; filc_ents[306].entry = (void *)ent_strtold_l;
+    /* glibc's _GNU_SOURCE headers rename these to __isoc23_*. */
+    filc_ents[307].name = "__isoc23_strtol_l"; filc_ents[307].entry = (void *)ent_strtol_l;
+    filc_ents[308].name = "__isoc23_strtoll_l"; filc_ents[308].entry = (void *)ent_strtoll_l;
+    filc_ents[309].name = "__isoc23_strtoul_l"; filc_ents[309].entry = (void *)ent_strtoul_l;
+    filc_ents[310].name = "__isoc23_strtoull_l"; filc_ents[310].entry = (void *)ent_strtoull_l;
+    filc_ents[311].name = "gmtime_r"; filc_ents[311].entry = (void *)ent_gmtime_r;
+    filc_ents[312].name = "localtime_r"; filc_ents[312].entry = (void *)ent_localtime_r;
+    filc_ents[313].name = "asctime_r"; filc_ents[313].entry = (void *)ent_asctime_r;
+    filc_ents[314].name = "ctime_r"; filc_ents[314].entry = (void *)ent_ctime_r;
+    filc_ents[315].name = "gmtime"; filc_ents[315].entry = (void *)ent_gmtime;
+    filc_ents[316].name = "localtime"; filc_ents[316].entry = (void *)ent_localtime;
+    filc_ents[317].name = "asctime"; filc_ents[317].entry = (void *)ent_asctime;
+    filc_ents[318].name = "ctime"; filc_ents[318].entry = (void *)ent_ctime;
+    filc_ents[319].name = "mktime"; filc_ents[319].entry = (void *)ent_mktime;
+    filc_ents[320].name = "timelocal"; filc_ents[320].entry = (void *)ent_mktime;
+    filc_ents[321].name = "time"; filc_ents[321].entry = (void *)ent_time;
+    filc_ents[322].name = "timegm"; filc_ents[322].entry = (void *)ent_timegm;
+    filc_ents[323].name = "aligned_alloc"; filc_ents[323].entry = (void *)ent_aligned_alloc;
+    filc_ents[324].name = "readlink"; filc_ents[324].entry = (void *)ent_readlink;
+    filc_ents[325].name = "realpath"; filc_ents[325].entry = (void *)ent_realpath;
+    filc_ents[326].name = "readlinkat"; filc_ents[326].entry = (void *)ent_readlinkat;
+    filc_ents[327].name = "gethostname"; filc_ents[327].entry = (void *)ent_gethostname;
+    filc_ents[328].name = "getdomainname"; filc_ents[328].entry = (void *)ent_getdomainname;
+    filc_ents[329].name = "confstr"; filc_ents[329].entry = (void *)ent_confstr;
+    filc_ents[330].name = "uname"; filc_ents[330].entry = (void *)ent_uname;
+    filc_ents[331].name = "sysinfo"; filc_ents[331].entry = (void *)ent_sysinfo;
+    filc_ents[332].name = "getrusage"; filc_ents[332].entry = (void *)ent_getrusage;
     real_longjmp = (filc_lj_fn)dlsym(RTLD_DEFAULT, "longjmp");
     real__longjmp = (filc_lj_fn)dlsym(RTLD_DEFAULT, "_longjmp");
     real_siglongjmp = (filc_lj_fn)dlsym(RTLD_DEFAULT, "siglongjmp");
@@ -6927,6 +8948,8 @@ static void filc_resolve_libc(void)
     /* The plain name is the GNU function. User code takes the
      * address of __xpg_strerror_r. Drop the GNU pointer either way. */
     filc_ents[255].real = dlsym(RTLD_DEFAULT, "__xpg_strerror_r");
+    for (i = 0; i < (int)(sizeof filc_raw / sizeof filc_raw[0]); i++)
+        filc_raw[i].real = dlsym(RTLD_DEFAULT, filc_raw[i].name);
 }
 
 /* ---- conservative heap GC ------------------------------------------- */
@@ -7174,6 +9197,13 @@ static int filc_stacks_known(void)
     return 1;
 }
 
+static void filc_mark_stdio_pins(void)
+{
+    int i;
+    for (i = 0; i < filc_stdio_npins; i++)
+        filc_mark_push(filc_stdio_pins[i].obj);
+}
+
 static void filc_gc_finish_roots(int all_threads)
 {
     filc_thr *t;
@@ -7182,6 +9212,7 @@ static void filc_gc_finish_roots(int all_threads)
     filc_work_n = 0;
     filc_mark_nonheap();
     filc_mark_live_tls();
+    filc_mark_stdio_pins();
     filc_scan_self();
     if (all_threads) {
         for (t = filc_threads; t; t = t->next)
