@@ -1,25 +1,29 @@
 #include <signal.h>
-#include <stdlib.h>
-#include <unistd.h>
-static volatile int got;
-static void on_alarm(int sig)
-{
-    (void)sig;
-    got = 1;
-}
 int main(void)
 {
-    int i;
-    signal(SIGALRM, on_alarm);
-    alarm(1);
-    for (i = 0; i < 10000000 && !got; i++) {
-        char *p = malloc(16);
-        if (!p)
-            return 1;
-        p[0] = 1;
-        free(p);
-    }
-    if (!got)
+    sigset_t cur, old;
+    int n;
+    int (*pend)(sigset_t *);
+    int (*mask)(int, const sigset_t *, sigset_t *);
+    n = sigpending(&cur);
+    if (n != 0)
         return 2;
+    n = sigprocmask(SIG_BLOCK, 0, &old);
+    if (n != 0)
+        return 3;
+    n = sigprocmask(SIG_SETMASK, &old, 0);
+    if (n != 0)
+        return 4;
+    n = sigprocmask(SIG_BLOCK, 0, 0);
+    if (n != 0)
+        return 5;
+    pend = sigpending;
+    n = pend(&cur);
+    if (n != 0)
+        return 6;
+    mask = sigprocmask;
+    n = mask(SIG_BLOCK, 0, &old);
+    if (n != 0)
+        return 7;
     return 0;
 }

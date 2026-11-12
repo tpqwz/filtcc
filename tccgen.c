@@ -4500,6 +4500,516 @@ static int filc_intercept(const char *name, int *pnb, int ret_ptr)
         *pnb = 3;
         return 1;
     }
+    if (!strcmp(name, "getrlimit") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_getrlimit, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "times") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_times, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if (!strcmp(name, "gettimeofday") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_gettimeofday, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if ((!strcmp(name, "clock_gettime") || !strcmp(name, "clock_getres"))
+        && nb == 2) {
+        /* clock_gettime has 't' where clock_getres has 'r'. */
+        tok = name[9] == 't' ? TOK_filc_clock_gettime : TOK_filc_clock_getres;
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(tok, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "nanosleep") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_nanosleep, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if ((!strcmp(name, "setrlimit") || !strcmp(name, "getitimer")) && nb == 2) {
+        /* setrlimit[0] == 's'; getitimer[0] == 'g'. */
+        tok = name[0] == 's' ? TOK_filc_setrlimit : TOK_filc_getitimer;
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(tok, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "setitimer") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_setitimer, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if ((!strcmp(name, "sched_getaffinity") || !strcmp(name, "sched_setaffinity"))
+        && nb == 3) {
+        /* sched_getaffinity[6] == 'g'; sched_setaffinity[6] == 's'. */
+        tok = name[6] == 'g' ? TOK_filc_sched_getaffinity
+            : TOK_filc_sched_setaffinity;
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_finish_intercept(tok, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "sigpending") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_sigpending, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if (!strcmp(name, "sigprocmask") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_sigprocmask, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if ((!strcmp(name, "sigemptyset") || !strcmp(name, "sigfillset"))
+        && nb == 1) {
+        /* sigemptyset[3] == 'e'; sigfillset[3] == 'f'. */
+        tok = name[3] == 'e' ? TOK_filc_sigemptyset : TOK_filc_sigfillset;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(tok, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if ((!strcmp(name, "sigaddset") || !strcmp(name, "sigdelset")
+        || !strcmp(name, "sigismember")) && nb == 2) {
+        /* sigaddset[3] == 'a'; sigdelset[3] == 'd'. */
+        tok = name[3] == 'a' ? TOK_filc_sigaddset
+            : name[3] == 'd' ? TOK_filc_sigdelset
+            : TOK_filc_sigismember;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(tok, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "sigaltstack") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_sigaltstack, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if ((!strcmp(name, "sched_getparam") || !strcmp(name, "sched_setparam"))
+        && nb == 2) {
+        /* sched_getparam[6] == 'g'; sched_setparam[6] == 's'. */
+        tok = name[6] == 'g' ? TOK_filc_sched_getparam : TOK_filc_sched_setparam;
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(tok, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "sched_rr_get_interval") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_sched_rr_get_interval, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "clock_nanosleep") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_push_caparg(3);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_clock_nanosleep, 6);
+        *pnb = 6;
+        return 1;
+    }
+    if (!strcmp(name, "pipe") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_pipe, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if (!strcmp(name, "poll") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_poll, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "statvfs") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_statvfs, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "fstatvfs") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_fstatvfs, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "getgroups") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_getgroups, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "select") && nb == 5) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_push_caparg(3);
+        filc_push_ival(3);
+        filc_push_caparg(4);
+        filc_push_ival(4);
+        filc_finish_intercept(TOK_filc_select, 9);
+        *pnb = 9;
+        return 1;
+    }
+    if ((!strcmp(name, "unlink") || !strcmp(name, "rmdir")
+        || !strcmp(name, "chdir")) && nb == 1) {
+        tok = name[0] == 'u' ? TOK_filc_unlink
+            : name[0] == 'r' ? TOK_filc_rmdir
+            : TOK_filc_chdir;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(tok, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if ((!strcmp(name, "mkdir") || !strcmp(name, "chmod")
+        || !strcmp(name, "access") || !strcmp(name, "truncate")) && nb == 2) {
+        tok = name[0] == 'm' ? TOK_filc_mkdir
+            : name[0] == 'c' ? TOK_filc_chmod
+            : name[0] == 'a' ? TOK_filc_access
+            : TOK_filc_truncate;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(tok, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "chown") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_chown, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if ((!strcmp(name, "symlink") || !strcmp(name, "link")) && nb == 2) {
+        tok = name[0] == 's' ? TOK_filc_symlink : TOK_filc_link;
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(tok, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "mkstemp") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_mkstemp, 2);
+        *pnb = 2;
+        return 1;
+    }
+    if ((!strcmp(name, "readv") || !strcmp(name, "writev")) && nb == 3) {
+        tok = name[0] == 'r' ? TOK_filc_readv : TOK_filc_writev;
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(tok, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "waitpid") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_waitpid, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "getrandom") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_getrandom, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "openat") && (nb == 3 || nb == 4)) {
+        int has = nb == 4;
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        if (has)
+            filc_push_ival(3);
+        else
+            vpushi(0);
+        vpushi(has);
+        filc_finish_intercept(TOK_filc_openat, 6);
+        *pnb = 6;
+        return 1;
+    }
+    if ((!strcmp(name, "unlinkat") || !strcmp(name, "mkdirat")) && nb == 3) {
+        tok = name[0] == 'u' ? TOK_filc_unlinkat : TOK_filc_mkdirat;
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(tok, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "symlinkat") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_symlinkat, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "linkat") && nb == 5) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_caparg(3);
+        filc_push_ival(3);
+        filc_push_ival(4);
+        filc_finish_intercept(TOK_filc_linkat, 7);
+        *pnb = 7;
+        return 1;
+    }
+    if (!strcmp(name, "renameat") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_caparg(3);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_renameat, 6);
+        *pnb = 6;
+        return 1;
+    }
+    if (!strcmp(name, "fchmodat") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_fchmodat, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "lchown") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_lchown, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "mkdtemp") && nb == 1) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_finish_intercept(TOK_filc_mkdtemp, 2);
+        *pnb = 2;
+        filc_ret_mode = FILC_RET_GET;
+        return 1;
+    }
+    if (!strcmp(name, "futimens") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_futimens, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "utimensat") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_utimensat, 6);
+        *pnb = 6;
+        return 1;
+    }
+    if (!strcmp(name, "fstatat") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_fstatat, 6);
+        *pnb = 6;
+        return 1;
+    }
+    if (!strcmp(name, "faccessat") && nb == 4) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(TOK_filc_faccessat, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "fchownat") && nb == 5) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_push_ival(4);
+        filc_finish_intercept(TOK_filc_fchownat, 6);
+        *pnb = 6;
+        return 1;
+    }
+    if ((!strcmp(name, "preadv") || !strcmp(name, "pwritev")) && nb == 4) {
+        tok = name[1] == 'r' ? TOK_filc_preadv : TOK_filc_pwritev;
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_push_ival(3);
+        filc_finish_intercept(tok, 5);
+        *pnb = 5;
+        return 1;
+    }
+    if (!strcmp(name, "posix_memalign") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_posix_memalign, 4);
+        *pnb = 4;
+        return 1;
+    }
+    if (!strcmp(name, "getentropy") && nb == 2) {
+        filc_spill_call(nb);
+        filc_push_caparg(0);
+        filc_push_ival(0);
+        filc_push_ival(1);
+        filc_finish_intercept(TOK_filc_getentropy, 3);
+        *pnb = 3;
+        return 1;
+    }
+    if (!strcmp(name, "sigaction") && nb == 3) {
+        filc_spill_call(nb);
+        filc_push_ival(0);
+        filc_push_caparg(1);
+        filc_push_ival(1);
+        filc_push_caparg(2);
+        filc_push_ival(2);
+        filc_finish_intercept(TOK_filc_sigaction, 5);
+        *pnb = 5;
+        return 1;
+    }
     if (!strcmp(name, "readlinkat") && nb == 4) {
         filc_spill_call(nb);
         filc_push_ival(0);

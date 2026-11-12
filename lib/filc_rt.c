@@ -38,6 +38,45 @@
  * 0 does not touch the buffer and may be a null pointer. uname
  * checks a writable struct utsname. sysinfo checks a writable
  * struct sysinfo. getrusage checks a writable struct rusage.
+ * getrusage's sibling getrlimit checks a writable struct rlimit.
+ * times checks a writable struct tms. A null buffer does not
+ * touch memory and still returns the clock. gettimeofday checks
+ * a timeval and a timezone when those pointers are set. A null
+ * pointer skips that half. clock_gettime checks a timespec.
+ * clock_getres does too, and a null resolution pointer is legal.
+ * nanosleep reads a timespec and, when the remainder pointer is
+ * set, writes one. setrlimit reads a struct rlimit. getitimer
+ * writes a struct itimerval. setitimer reads the new value and,
+ * when the old pointer is set, writes one. sched_getaffinity
+ * checks cpusetsize writable bytes. sched_setaffinity checks that
+ * many readable bytes. A size of 0 does not touch the mask.
+ * sigpending writes a sigset_t. sigprocmask reads the new set and
+ * writes the old set when those pointers are set. sigemptyset
+ * and sigfillset write a sigset_t. sigaddset and sigdelset do
+ * too. sigismember reads one. sigaltstack reads a stack_t and
+ * writes one when those pointers are set. sched_getparam writes
+ * a sched_param. sched_setparam reads one. sched_rr_get_interval
+ * writes a timespec. clock_nanosleep reads a timespec and writes
+ * the remainder when that pointer is set. pipe writes two ints.
+ * poll checks nfds pollfd slots. A count of 0 does not touch the
+ * array. statvfs checks a path and a struct statvfs. fstatvfs
+ * checks the struct. getgroups checks size gid_t slots. A size
+ * of 0 does not touch the list. select checks each fd_set and
+ * the timeval when those pointers are set. unlink, rmdir, mkdir,
+ * chdir, chmod, access, chown, and truncate check a path.
+ * symlink and link check both paths. mkstemp checks a writable
+ * template. readv and writev check each iovec buffer. waitpid
+ * checks an int when the status pointer is set. getrandom checks
+ * buflen writable bytes. openat, unlinkat, mkdirat, symlinkat,
+ * linkat, renameat, fchmodat, and lchown check their paths.
+ * mkdtemp checks a writable template and returns that buffer.
+ * futimens and utimensat check two timespecs when that pointer
+ * is set. fstatat checks a path and a struct stat. faccessat
+ * and fchownat check a path. preadv and pwritev check each
+ * iovec buffer. posix_memalign stores a filc pointer. getentropy
+ * checks length writable bytes. sigaction checks the struct.
+ * SIG_DFL and SIG_IGN are not functions. Any other handler must
+ * be one. A saved action keeps that function capability.
  * fgetws checks n wchar_t. A negative n panics. A zero n is a
  * size-0 check. The return keeps the buffer capability.
  * getline and getdelim do too. A buffer that cannot hold the line is
@@ -272,17 +311,27 @@
 #include <dlfcn.h>
 #include <link.h>
 #include <signal.h>
+#include <sched.h>
+#include <poll.h>
+#include <sys/statvfs.h>
+#include <sys/select.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+#include <sys/random.h>
+#include <errno.h>
 #include <ucontext.h>
 #include <stdarg.h>
 #include <sys/mman.h>
 #include <strings.h>
 #include <locale.h>
 #include <time.h>
+#include <sys/time.h>
 #include <limits.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <sys/sysinfo.h>
 #include <sys/resource.h>
+#include <sys/times.h>
 
 /* glibc headers #define __attribute__ to empty when __has_attribute is 0.
  * tcc still parses attributes; bcheck.c and bt-log.c undef the same way. */
@@ -3672,6 +3721,536 @@ int filc_getrusage(int who, void *bl, struct rusage *usage)
     return getrusage(who, usage);
 }
 
+int filc_getrlimit(int resource, void *bl, struct rlimit *rlim)
+{
+    filc_check(bl, rlim, sizeof(*rlim), 1);
+    return getrlimit(resource, rlim);
+}
+
+/* A null buffer only asks for the clock. A real buffer is one
+ * struct tms, writable. */
+clock_t filc_times(void *bl, struct tms *buf)
+{
+    if (buf)
+        filc_check(bl, buf, sizeof(*buf), 1);
+    return times(buf);
+}
+
+int filc_gettimeofday(void *tl, struct timeval *tv, void *zl,
+    struct timezone *tz)
+{
+    if (tv)
+        filc_check(tl, tv, sizeof(*tv), 1);
+    if (tz)
+        filc_check(zl, tz, sizeof(*tz), 1);
+    return gettimeofday(tv, tz);
+}
+
+int filc_clock_gettime(clockid_t clk, void *bl, struct timespec *tp)
+{
+    filc_check(bl, tp, sizeof(*tp), 1);
+    return clock_gettime(clk, tp);
+}
+
+int filc_clock_getres(clockid_t clk, void *bl, struct timespec *tp)
+{
+    if (tp)
+        filc_check(bl, tp, sizeof(*tp), 1);
+    return clock_getres(clk, tp);
+}
+
+int filc_nanosleep(void *rl, const struct timespec *req, void *ml,
+    struct timespec *rem)
+{
+    filc_check(rl, (void *)req, sizeof(*req), 0);
+    if (rem)
+        filc_check(ml, rem, sizeof(*rem), 1);
+    return nanosleep(req, rem);
+}
+
+int filc_setrlimit(int resource, void *bl, const struct rlimit *rlim)
+{
+    filc_check(bl, (void *)rlim, sizeof(*rlim), 0);
+    return setrlimit(resource, rlim);
+}
+
+int filc_getitimer(int which, void *bl, struct itimerval *cur)
+{
+    filc_check(bl, cur, sizeof(*cur), 1);
+    return getitimer(which, cur);
+}
+
+int filc_setitimer(int which, void *nl, const struct itimerval *neu,
+    void *ol, struct itimerval *old)
+{
+    filc_check(nl, (void *)neu, sizeof(*neu), 0);
+    if (old)
+        filc_check(ol, old, sizeof(*old), 1);
+    return setitimer(which, neu, old);
+}
+
+int filc_sched_getaffinity(pid_t pid, size_t cpusetsize, void *ml,
+    cpu_set_t *mask)
+{
+    if (cpusetsize)
+        filc_check(ml, mask, cpusetsize, 1);
+    return sched_getaffinity(pid, cpusetsize, mask);
+}
+
+int filc_sched_setaffinity(pid_t pid, size_t cpusetsize, void *ml,
+    const cpu_set_t *mask)
+{
+    if (cpusetsize)
+        filc_check(ml, (void *)mask, cpusetsize, 0);
+    return sched_setaffinity(pid, cpusetsize, mask);
+}
+
+int filc_sigpending(void *sl, sigset_t *set)
+{
+    filc_check(sl, set, sizeof(*set), 1);
+    return sigpending(set);
+}
+
+int filc_sigprocmask(int how, void *sl, const sigset_t *set, void *ol,
+    sigset_t *old)
+{
+    if (set)
+        filc_check(sl, (void *)set, sizeof(*set), 0);
+    if (old)
+        filc_check(ol, old, sizeof(*old), 1);
+    return sigprocmask(how, set, old);
+}
+
+int filc_sigemptyset(void *sl, sigset_t *set)
+{
+    filc_check(sl, set, sizeof(*set), 1);
+    return sigemptyset(set);
+}
+
+int filc_sigfillset(void *sl, sigset_t *set)
+{
+    filc_check(sl, set, sizeof(*set), 1);
+    return sigfillset(set);
+}
+
+int filc_sigaddset(void *sl, sigset_t *set, int sig)
+{
+    filc_check(sl, set, sizeof(*set), 1);
+    return sigaddset(set, sig);
+}
+
+int filc_sigdelset(void *sl, sigset_t *set, int sig)
+{
+    filc_check(sl, set, sizeof(*set), 1);
+    return sigdelset(set, sig);
+}
+
+int filc_sigismember(void *sl, const sigset_t *set, int sig)
+{
+    filc_check(sl, (void *)set, sizeof(*set), 0);
+    return sigismember(set, sig);
+}
+
+int filc_sigaltstack(void *sl, const stack_t *ss, void *ol, stack_t *old)
+{
+    if (ss)
+        filc_check(sl, (void *)ss, sizeof(*ss), 0);
+    if (old)
+        filc_check(ol, old, sizeof(*old), 1);
+    return sigaltstack(ss, old);
+}
+
+int filc_sched_getparam(pid_t pid, void *pl, struct sched_param *param)
+{
+    filc_check(pl, param, sizeof(*param), 1);
+    return sched_getparam(pid, param);
+}
+
+int filc_sched_setparam(pid_t pid, void *pl, const struct sched_param *param)
+{
+    filc_check(pl, (void *)param, sizeof(*param), 0);
+    return sched_setparam(pid, param);
+}
+
+int filc_sched_rr_get_interval(pid_t pid, void *tl, struct timespec *tp)
+{
+    filc_check(tl, tp, sizeof(*tp), 1);
+    return sched_rr_get_interval(pid, tp);
+}
+
+int filc_clock_nanosleep(clockid_t clk, int flags, void *rl,
+    const struct timespec *req, void *ml, struct timespec *rem)
+{
+    filc_check(rl, (void *)req, sizeof(*req), 0);
+    if (rem)
+        filc_check(ml, rem, sizeof(*rem), 1);
+    return clock_nanosleep(clk, flags, req, rem);
+}
+
+int filc_pipe(void *bl, int *fds)
+{
+    filc_check(bl, fds, 2 * sizeof(int), 1);
+    return pipe(fds);
+}
+
+int filc_poll(void *bl, struct pollfd *fds, nfds_t nfds, int timeout)
+{
+    size_t bytes;
+    if (nfds) {
+        if (nfds > (size_t)-1 / sizeof(*fds))
+            filc_panic("out of bounds");
+        bytes = (size_t)nfds * sizeof(*fds);
+        filc_check(bl, fds, bytes, 1);
+    }
+    return poll(fds, nfds, timeout);
+}
+
+int filc_statvfs(void *pl, const char *path, void *bl, struct statvfs *buf)
+{
+    filc_strlen(pl, path);
+    filc_check(bl, buf, sizeof(*buf), 1);
+    return statvfs(path, buf);
+}
+
+int filc_fstatvfs(int fd, void *bl, struct statvfs *buf)
+{
+    filc_check(bl, buf, sizeof(*buf), 1);
+    return fstatvfs(fd, buf);
+}
+
+int filc_getgroups(int size, void *bl, gid_t *list)
+{
+    size_t bytes;
+    if (size > 0) {
+        if ((size_t)size > (size_t)-1 / sizeof(gid_t))
+            filc_panic("out of bounds");
+        bytes = (size_t)size * sizeof(gid_t);
+        filc_check(bl, list, bytes, 1);
+    }
+    return getgroups(size, list);
+}
+
+int filc_select(int nfds, void *rl, fd_set *readfds, void *wl, fd_set *writefds,
+    void *el, fd_set *exceptfds, void *tl, struct timeval *timeout)
+{
+    if (readfds)
+        filc_check(rl, readfds, sizeof(*readfds), 1);
+    if (writefds)
+        filc_check(wl, writefds, sizeof(*writefds), 1);
+    if (exceptfds)
+        filc_check(el, exceptfds, sizeof(*exceptfds), 1);
+    if (timeout)
+        filc_check(tl, timeout, sizeof(*timeout), 1);
+    return select(nfds, readfds, writefds, exceptfds, timeout);
+}
+
+int filc_unlink(void *pl, const char *path)
+{
+    filc_strlen(pl, path);
+    return unlink(path);
+}
+
+int filc_rmdir(void *pl, const char *path)
+{
+    filc_strlen(pl, path);
+    return rmdir(path);
+}
+
+int filc_mkdir(void *pl, const char *path, mode_t mode)
+{
+    filc_strlen(pl, path);
+    return mkdir(path, mode);
+}
+
+int filc_chdir(void *pl, const char *path)
+{
+    filc_strlen(pl, path);
+    return chdir(path);
+}
+
+int filc_chmod(void *pl, const char *path, mode_t mode)
+{
+    filc_strlen(pl, path);
+    return chmod(path, mode);
+}
+
+int filc_access(void *pl, const char *path, int mode)
+{
+    filc_strlen(pl, path);
+    return access(path, mode);
+}
+
+int filc_chown(void *pl, const char *path, uid_t uid, gid_t gid)
+{
+    filc_strlen(pl, path);
+    return chown(path, uid, gid);
+}
+
+int filc_symlink(void *tl, const char *target, void *ll, const char *linkpath)
+{
+    filc_strlen(tl, target);
+    filc_strlen(ll, linkpath);
+    return symlink(target, linkpath);
+}
+
+int filc_link(void *ol, const char *old, void *nl, const char *newname)
+{
+    filc_strlen(ol, old);
+    filc_strlen(nl, newname);
+    return link(old, newname);
+}
+
+int filc_truncate(void *pl, const char *path, off_t length)
+{
+    filc_strlen(pl, path);
+    return truncate(path, length);
+}
+
+int filc_mkstemp(void *tl, char *template)
+{
+    size_t n;
+    filc_strlen(tl, template);
+    n = strlen(template) + 1;
+    filc_check(tl, template, n, 1);
+    return mkstemp(template);
+}
+
+static void filc_iov_check(void *il, const struct iovec *iov, int iovcnt,
+    int writing)
+{
+    int i;
+    size_t bytes;
+    if (iovcnt < 0)
+        filc_panic("out of bounds");
+    if (iovcnt == 0)
+        return;
+    if ((size_t)iovcnt > (size_t)-1 / sizeof(*iov))
+        filc_panic("out of bounds");
+    bytes = (size_t)iovcnt * sizeof(*iov);
+    filc_check(il, (void *)iov, bytes, 0);
+    for (i = 0; i < iovcnt; i++) {
+        void *cap;
+        if (!iov[i].iov_len)
+            continue;
+        cap = filc_load_cap(il, (void *)&iov[i].iov_base);
+        filc_check(cap, iov[i].iov_base, iov[i].iov_len, writing);
+    }
+}
+
+ssize_t filc_readv(int fd, void *il, const struct iovec *iov, int iovcnt)
+{
+    filc_iov_check(il, iov, iovcnt, 1);
+    return readv(fd, iov, iovcnt);
+}
+
+ssize_t filc_writev(int fd, void *il, const struct iovec *iov, int iovcnt)
+{
+    filc_iov_check(il, iov, iovcnt, 0);
+    return writev(fd, iov, iovcnt);
+}
+
+pid_t filc_waitpid(pid_t pid, void *sl, int *status, int options)
+{
+    if (status)
+        filc_check(sl, status, sizeof(*status), 1);
+    return waitpid(pid, status, options);
+}
+
+ssize_t filc_getrandom(void *bl, void *buf, size_t buflen, unsigned int flags)
+{
+    if (buflen)
+        filc_check(bl, buf, buflen, 1);
+    return getrandom(buf, buflen, flags);
+}
+
+int filc_openat(int dirfd, void *pl, const char *path, int flags,
+    unsigned mode, int has_mode)
+{
+    filc_strlen(pl, path);
+    if (has_mode)
+        return openat(dirfd, path, flags, (mode_t)mode);
+    return openat(dirfd, path, flags);
+}
+
+int filc_unlinkat(int dirfd, void *pl, const char *path, int flags)
+{
+    filc_strlen(pl, path);
+    return unlinkat(dirfd, path, flags);
+}
+
+int filc_mkdirat(int dirfd, void *pl, const char *path, mode_t mode)
+{
+    filc_strlen(pl, path);
+    return mkdirat(dirfd, path, mode);
+}
+
+int filc_symlinkat(void *tl, const char *target, int dirfd, void *ll,
+    const char *linkpath)
+{
+    filc_strlen(tl, target);
+    filc_strlen(ll, linkpath);
+    return symlinkat(target, dirfd, linkpath);
+}
+
+int filc_linkat(int olddfd, void *ol, const char *old, int newdfd, void *nl,
+    const char *newname, int flags)
+{
+    filc_strlen(ol, old);
+    filc_strlen(nl, newname);
+    return linkat(olddfd, old, newdfd, newname, flags);
+}
+
+int filc_renameat(int olddfd, void *ol, const char *old, int newdfd, void *nl,
+    const char *newname)
+{
+    filc_strlen(ol, old);
+    filc_strlen(nl, newname);
+    return renameat(olddfd, old, newdfd, newname);
+}
+
+int filc_fchmodat(int dirfd, void *pl, const char *path, mode_t mode, int flags)
+{
+    filc_strlen(pl, path);
+    return fchmodat(dirfd, path, mode, flags);
+}
+
+int filc_lchown(void *pl, const char *path, uid_t uid, gid_t gid)
+{
+    filc_strlen(pl, path);
+    return lchown(path, uid, gid);
+}
+
+char *filc_mkdtemp(void *tl, char *template)
+{
+    char *r;
+    size_t n;
+    filc_strlen(tl, template);
+    n = strlen(template) + 1;
+    filc_check(tl, template, n, 1);
+    r = mkdtemp(template);
+    filc_ret_cap = r ? tl : NULL;
+    return r;
+}
+
+int filc_futimens(int fd, void *tl, const struct timespec *times)
+{
+    if (times)
+        filc_check(tl, (void *)times, 2 * sizeof(*times), 0);
+    return futimens(fd, times);
+}
+
+int filc_utimensat(int dirfd, void *pl, const char *path, void *tl,
+    const struct timespec *times, int flags)
+{
+    if (path)
+        filc_strlen(pl, path);
+    if (times)
+        filc_check(tl, (void *)times, 2 * sizeof(*times), 0);
+    return utimensat(dirfd, path, times, flags);
+}
+
+int filc_fstatat(int dirfd, void *pl, const char *path, void *bl,
+    struct stat *buf, int flags)
+{
+    filc_strlen(pl, path);
+    filc_check(bl, buf, sizeof(*buf), 1);
+    return fstatat(dirfd, path, buf, flags);
+}
+
+int filc_faccessat(int dirfd, void *pl, const char *path, int mode, int flags)
+{
+    filc_strlen(pl, path);
+    return faccessat(dirfd, path, mode, flags);
+}
+
+int filc_fchownat(int dirfd, void *pl, const char *path, uid_t uid, gid_t gid,
+    int flags)
+{
+    filc_strlen(pl, path);
+    return fchownat(dirfd, path, uid, gid, flags);
+}
+
+ssize_t filc_preadv(int fd, void *il, const struct iovec *iov, int iovcnt,
+    off_t offset)
+{
+    filc_iov_check(il, iov, iovcnt, 1);
+    return preadv(fd, iov, iovcnt, offset);
+}
+
+ssize_t filc_pwritev(int fd, void *il, const struct iovec *iov, int iovcnt,
+    off_t offset)
+{
+    filc_iov_check(il, iov, iovcnt, 0);
+    return pwritev(fd, iov, iovcnt, offset);
+}
+
+int filc_posix_memalign(void *ml, void **memptr, size_t alignment, size_t size)
+{
+    void *p;
+    filc_check(ml, memptr, sizeof(*memptr), 1);
+    if (!alignment || (alignment & (alignment - 1))
+        || (alignment % sizeof(void *)))
+        return EINVAL;
+    if (size)
+        p = filc_alloc_heap_at(size, alignment, 0);
+    else
+        p = filc_malloc(0);
+    if (!p)
+        return ENOMEM;
+    filc_store_ptr(ml, memptr, p, (uintptr_t)p);
+    return 0;
+}
+
+int filc_getentropy(void *bl, void *buf, size_t length)
+{
+    if (length)
+        filc_check(bl, buf, length, 1);
+    return getentropy(buf, length);
+}
+
+static void filc_sigact_check(void *al, struct sigaction *act)
+{
+    void (*h)(int);
+    void *cap;
+    h = act->sa_handler;
+    if (h == SIG_DFL || h == SIG_IGN)
+        return;
+    cap = filc_load_cap(al, (void *)&act->sa_handler);
+    if (!cap)
+        cap = (void *)h;
+    filc_check_func(cap, (void *)h);
+}
+
+static void filc_sigact_publish(void *ol, struct sigaction *old)
+{
+    void (*h)(int);
+    filc_object *o;
+    h = old->sa_handler;
+    if (h == SIG_DFL || h == SIG_IGN)
+        return;
+    filc_lock();
+    o = filc_lookup((void *)h);
+    filc_unlock();
+    if (o && (o->flags & FILC_FUNC) && o->payload == (void *)h)
+        filc_store_ptr(ol, (void *)&old->sa_handler, (void *)h, (uintptr_t)h);
+}
+
+int filc_sigaction(int sig, void *al, const struct sigaction *act, void *ol,
+    struct sigaction *old)
+{
+    int r;
+    if (act) {
+        filc_check(al, (void *)act, sizeof(*act), 0);
+        filc_sigact_check(al, (struct sigaction *)act);
+    }
+    if (old)
+        filc_check(ol, old, sizeof(*old), 1);
+    r = sigaction(sig, act, old);
+    if (r == 0 && old)
+        filc_sigact_publish(ol, old);
+    return r;
+}
+
 ssize_t filc_write(void *lower, int fd, const void *buf, size_t count)
 {
     filc_check(lower, (void *)buf, count, 0);
@@ -6772,6 +7351,339 @@ static int ent_getrusage(int who, struct rusage *usage)
     return filc_getrusage(who, filc_call_get(0), usage);
 }
 
+static int ent_getrlimit(int resource, struct rlimit *rlim)
+{
+    return filc_getrlimit(resource, filc_call_get(0), rlim);
+}
+
+static clock_t ent_times(struct tms *buf)
+{
+    return filc_times(filc_call_get(0), buf);
+}
+
+static int ent_gettimeofday(struct timeval *tv, struct timezone *tz)
+{
+    return filc_gettimeofday(filc_call_get(0), tv, filc_call_get(1), tz);
+}
+
+static int ent_clock_gettime(clockid_t clk, struct timespec *tp)
+{
+    return filc_clock_gettime(clk, filc_call_get(0), tp);
+}
+
+static int ent_clock_getres(clockid_t clk, struct timespec *tp)
+{
+    return filc_clock_getres(clk, filc_call_get(0), tp);
+}
+
+static int ent_nanosleep(const struct timespec *req, struct timespec *rem)
+{
+    return filc_nanosleep(filc_call_get(0), req, filc_call_get(1), rem);
+}
+
+static int ent_setrlimit(int resource, const struct rlimit *rlim)
+{
+    return filc_setrlimit(resource, filc_call_get(0), rlim);
+}
+
+static int ent_getitimer(int which, struct itimerval *cur)
+{
+    return filc_getitimer(which, filc_call_get(0), cur);
+}
+
+static int ent_setitimer(int which, const struct itimerval *neu,
+    struct itimerval *old)
+{
+    return filc_setitimer(which, filc_call_get(0), neu, filc_call_get(1), old);
+}
+
+static int ent_sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask)
+{
+    return filc_sched_getaffinity(pid, cpusetsize, filc_call_get(0), mask);
+}
+
+static int ent_sched_setaffinity(pid_t pid, size_t cpusetsize,
+    const cpu_set_t *mask)
+{
+    return filc_sched_setaffinity(pid, cpusetsize, filc_call_get(0), mask);
+}
+
+static int ent_sigpending(sigset_t *set)
+{
+    return filc_sigpending(filc_call_get(0), set);
+}
+
+static int ent_sigprocmask(int how, const sigset_t *set, sigset_t *old)
+{
+    return filc_sigprocmask(how, filc_call_get(0), set, filc_call_get(1), old);
+}
+
+static int ent_sigemptyset(sigset_t *set)
+{
+    return filc_sigemptyset(filc_call_get(0), set);
+}
+
+static int ent_sigfillset(sigset_t *set)
+{
+    return filc_sigfillset(filc_call_get(0), set);
+}
+
+static int ent_sigaddset(sigset_t *set, int sig)
+{
+    return filc_sigaddset(filc_call_get(0), set, sig);
+}
+
+static int ent_sigdelset(sigset_t *set, int sig)
+{
+    return filc_sigdelset(filc_call_get(0), set, sig);
+}
+
+static int ent_sigismember(const sigset_t *set, int sig)
+{
+    return filc_sigismember(filc_call_get(0), set, sig);
+}
+
+static int ent_sigaltstack(const stack_t *ss, stack_t *old)
+{
+    return filc_sigaltstack(filc_call_get(0), ss, filc_call_get(1), old);
+}
+
+static int ent_sched_getparam(pid_t pid, struct sched_param *param)
+{
+    return filc_sched_getparam(pid, filc_call_get(0), param);
+}
+
+static int ent_sched_setparam(pid_t pid, const struct sched_param *param)
+{
+    return filc_sched_setparam(pid, filc_call_get(0), param);
+}
+
+static int ent_sched_rr_get_interval(pid_t pid, struct timespec *tp)
+{
+    return filc_sched_rr_get_interval(pid, filc_call_get(0), tp);
+}
+
+static int ent_clock_nanosleep(clockid_t clk, int flags,
+    const struct timespec *req, struct timespec *rem)
+{
+    return filc_clock_nanosleep(clk, flags, filc_call_get(0), req,
+        filc_call_get(1), rem);
+}
+
+static int ent_pipe(int *fds)
+{
+    return filc_pipe(filc_call_get(0), fds);
+}
+
+static int ent_poll(struct pollfd *fds, nfds_t nfds, int timeout)
+{
+    return filc_poll(filc_call_get(0), fds, nfds, timeout);
+}
+
+static int ent_statvfs(const char *path, struct statvfs *buf)
+{
+    return filc_statvfs(filc_call_get(0), path, filc_call_get(1), buf);
+}
+
+static int ent_fstatvfs(int fd, struct statvfs *buf)
+{
+    return filc_fstatvfs(fd, filc_call_get(0), buf);
+}
+
+static int ent_getgroups(int size, gid_t *list)
+{
+    return filc_getgroups(size, filc_call_get(0), list);
+}
+
+static int ent_select(int nfds, fd_set *readfds, fd_set *writefds,
+    fd_set *exceptfds, struct timeval *timeout)
+{
+    return filc_select(nfds, filc_call_get(0), readfds, filc_call_get(1),
+        writefds, filc_call_get(2), exceptfds, filc_call_get(3), timeout);
+}
+
+static int ent_unlink(const char *path)
+{
+    return filc_unlink(filc_call_get(0), path);
+}
+
+static int ent_rmdir(const char *path)
+{
+    return filc_rmdir(filc_call_get(0), path);
+}
+
+static int ent_mkdir(const char *path, mode_t mode)
+{
+    return filc_mkdir(filc_call_get(0), path, mode);
+}
+
+static int ent_chdir(const char *path)
+{
+    return filc_chdir(filc_call_get(0), path);
+}
+
+static int ent_chmod(const char *path, mode_t mode)
+{
+    return filc_chmod(filc_call_get(0), path, mode);
+}
+
+static int ent_access(const char *path, int mode)
+{
+    return filc_access(filc_call_get(0), path, mode);
+}
+
+static int ent_chown(const char *path, uid_t uid, gid_t gid)
+{
+    return filc_chown(filc_call_get(0), path, uid, gid);
+}
+
+static int ent_symlink(const char *target, const char *linkpath)
+{
+    return filc_symlink(filc_call_get(0), target, filc_call_get(1), linkpath);
+}
+
+static int ent_link(const char *old, const char *newname)
+{
+    return filc_link(filc_call_get(0), old, filc_call_get(1), newname);
+}
+
+static int ent_truncate(const char *path, off_t length)
+{
+    return filc_truncate(filc_call_get(0), path, length);
+}
+
+static int ent_mkstemp(char *template)
+{
+    return filc_mkstemp(filc_call_get(0), template);
+}
+
+static ssize_t ent_readv(int fd, const struct iovec *iov, int iovcnt)
+{
+    return filc_readv(fd, filc_call_get(0), iov, iovcnt);
+}
+
+static ssize_t ent_writev(int fd, const struct iovec *iov, int iovcnt)
+{
+    return filc_writev(fd, filc_call_get(0), iov, iovcnt);
+}
+
+static pid_t ent_waitpid(pid_t pid, int *status, int options)
+{
+    return filc_waitpid(pid, filc_call_get(0), status, options);
+}
+
+static ssize_t ent_getrandom(void *buf, size_t buflen, unsigned int flags)
+{
+    return filc_getrandom(filc_call_get(0), buf, buflen, flags);
+}
+
+static int ent_openat(int dirfd, const char *path, int flags, unsigned mode)
+{
+    return filc_openat(dirfd, filc_call_get(0), path, flags, mode, 1);
+}
+
+static int ent_unlinkat(int dirfd, const char *path, int flags)
+{
+    return filc_unlinkat(dirfd, filc_call_get(0), path, flags);
+}
+
+static int ent_mkdirat(int dirfd, const char *path, mode_t mode)
+{
+    return filc_mkdirat(dirfd, filc_call_get(0), path, mode);
+}
+
+static int ent_symlinkat(const char *target, int dirfd, const char *linkpath)
+{
+    return filc_symlinkat(filc_call_get(0), target, dirfd, filc_call_get(1),
+        linkpath);
+}
+
+static int ent_linkat(int olddfd, const char *old, int newdfd,
+    const char *newname, int flags)
+{
+    return filc_linkat(olddfd, filc_call_get(0), old, newdfd, filc_call_get(1),
+        newname, flags);
+}
+
+static int ent_renameat(int olddfd, const char *old, int newdfd,
+    const char *newname)
+{
+    return filc_renameat(olddfd, filc_call_get(0), old, newdfd, filc_call_get(1),
+        newname);
+}
+
+static int ent_fchmodat(int dirfd, const char *path, mode_t mode, int flags)
+{
+    return filc_fchmodat(dirfd, filc_call_get(0), path, mode, flags);
+}
+
+static int ent_lchown(const char *path, uid_t uid, gid_t gid)
+{
+    return filc_lchown(filc_call_get(0), path, uid, gid);
+}
+
+static char *ent_mkdtemp(char *template)
+{
+    return filc_mkdtemp(filc_call_get(0), template);
+}
+
+static int ent_futimens(int fd, const struct timespec *times)
+{
+    return filc_futimens(fd, filc_call_get(0), times);
+}
+
+static int ent_utimensat(int dirfd, const char *path,
+    const struct timespec *times, int flags)
+{
+    return filc_utimensat(dirfd, filc_call_get(0), path, filc_call_get(1),
+        times, flags);
+}
+
+static int ent_fstatat(int dirfd, const char *path, struct stat *buf, int flags)
+{
+    return filc_fstatat(dirfd, filc_call_get(0), path, filc_call_get(1), buf,
+        flags);
+}
+
+static int ent_faccessat(int dirfd, const char *path, int mode, int flags)
+{
+    return filc_faccessat(dirfd, filc_call_get(0), path, mode, flags);
+}
+
+static int ent_fchownat(int dirfd, const char *path, uid_t uid, gid_t gid,
+    int flags)
+{
+    return filc_fchownat(dirfd, filc_call_get(0), path, uid, gid, flags);
+}
+
+static ssize_t ent_preadv(int fd, const struct iovec *iov, int iovcnt,
+    off_t offset)
+{
+    return filc_preadv(fd, filc_call_get(0), iov, iovcnt, offset);
+}
+
+static ssize_t ent_pwritev(int fd, const struct iovec *iov, int iovcnt,
+    off_t offset)
+{
+    return filc_pwritev(fd, filc_call_get(0), iov, iovcnt, offset);
+}
+
+static int ent_posix_memalign(void **memptr, size_t alignment, size_t size)
+{
+    return filc_posix_memalign(filc_call_get(0), memptr, alignment, size);
+}
+
+static int ent_getentropy(void *buf, size_t length)
+{
+    return filc_getentropy(filc_call_get(0), buf, length);
+}
+
+static int ent_sigaction(int sig, const struct sigaction *act,
+    struct sigaction *old)
+{
+    return filc_sigaction(sig, filc_call_get(0), act, filc_call_get(1), old);
+}
+
 static ssize_t ent_write(int fd, const void *buf, size_t n)
 {
     return filc_write(filc_call_get(0), fd, buf, n);
@@ -8544,7 +9456,7 @@ static int ent_vswscanf(const wchar_t *s, const wchar_t *fmt, va_list ap)
     return r;
 }
 
-#define FILC_NENTS 333
+#define FILC_NENTS 396
 static struct {
     const char *name;
     void *real;
@@ -8921,6 +9833,69 @@ static void filc_resolve_libc(void)
     filc_ents[330].name = "uname"; filc_ents[330].entry = (void *)ent_uname;
     filc_ents[331].name = "sysinfo"; filc_ents[331].entry = (void *)ent_sysinfo;
     filc_ents[332].name = "getrusage"; filc_ents[332].entry = (void *)ent_getrusage;
+    filc_ents[333].name = "getrlimit"; filc_ents[333].entry = (void *)ent_getrlimit;
+    filc_ents[334].name = "times"; filc_ents[334].entry = (void *)ent_times;
+    filc_ents[335].name = "gettimeofday"; filc_ents[335].entry = (void *)ent_gettimeofday;
+    filc_ents[336].name = "clock_gettime"; filc_ents[336].entry = (void *)ent_clock_gettime;
+    filc_ents[337].name = "clock_getres"; filc_ents[337].entry = (void *)ent_clock_getres;
+    filc_ents[338].name = "nanosleep"; filc_ents[338].entry = (void *)ent_nanosleep;
+    filc_ents[339].name = "setrlimit"; filc_ents[339].entry = (void *)ent_setrlimit;
+    filc_ents[340].name = "getitimer"; filc_ents[340].entry = (void *)ent_getitimer;
+    filc_ents[341].name = "setitimer"; filc_ents[341].entry = (void *)ent_setitimer;
+    filc_ents[342].name = "sched_getaffinity"; filc_ents[342].entry = (void *)ent_sched_getaffinity;
+    filc_ents[343].name = "sched_setaffinity"; filc_ents[343].entry = (void *)ent_sched_setaffinity;
+    filc_ents[344].name = "sigpending"; filc_ents[344].entry = (void *)ent_sigpending;
+    filc_ents[345].name = "sigprocmask"; filc_ents[345].entry = (void *)ent_sigprocmask;
+    filc_ents[346].name = "sigemptyset"; filc_ents[346].entry = (void *)ent_sigemptyset;
+    filc_ents[347].name = "sigfillset"; filc_ents[347].entry = (void *)ent_sigfillset;
+    filc_ents[348].name = "sigaddset"; filc_ents[348].entry = (void *)ent_sigaddset;
+    filc_ents[349].name = "sigdelset"; filc_ents[349].entry = (void *)ent_sigdelset;
+    filc_ents[350].name = "sigismember"; filc_ents[350].entry = (void *)ent_sigismember;
+    filc_ents[351].name = "sigaltstack"; filc_ents[351].entry = (void *)ent_sigaltstack;
+    filc_ents[352].name = "sched_getparam"; filc_ents[352].entry = (void *)ent_sched_getparam;
+    filc_ents[353].name = "sched_setparam"; filc_ents[353].entry = (void *)ent_sched_setparam;
+    filc_ents[354].name = "sched_rr_get_interval"; filc_ents[354].entry = (void *)ent_sched_rr_get_interval;
+    filc_ents[355].name = "clock_nanosleep"; filc_ents[355].entry = (void *)ent_clock_nanosleep;
+    filc_ents[356].name = "pipe"; filc_ents[356].entry = (void *)ent_pipe;
+    filc_ents[357].name = "poll"; filc_ents[357].entry = (void *)ent_poll;
+    filc_ents[358].name = "statvfs"; filc_ents[358].entry = (void *)ent_statvfs;
+    filc_ents[359].name = "fstatvfs"; filc_ents[359].entry = (void *)ent_fstatvfs;
+    filc_ents[360].name = "getgroups"; filc_ents[360].entry = (void *)ent_getgroups;
+    filc_ents[361].name = "select"; filc_ents[361].entry = (void *)ent_select;
+    filc_ents[362].name = "unlink"; filc_ents[362].entry = (void *)ent_unlink;
+    filc_ents[363].name = "rmdir"; filc_ents[363].entry = (void *)ent_rmdir;
+    filc_ents[364].name = "mkdir"; filc_ents[364].entry = (void *)ent_mkdir;
+    filc_ents[365].name = "chdir"; filc_ents[365].entry = (void *)ent_chdir;
+    filc_ents[366].name = "chmod"; filc_ents[366].entry = (void *)ent_chmod;
+    filc_ents[367].name = "access"; filc_ents[367].entry = (void *)ent_access;
+    filc_ents[368].name = "chown"; filc_ents[368].entry = (void *)ent_chown;
+    filc_ents[369].name = "symlink"; filc_ents[369].entry = (void *)ent_symlink;
+    filc_ents[370].name = "link"; filc_ents[370].entry = (void *)ent_link;
+    filc_ents[371].name = "truncate"; filc_ents[371].entry = (void *)ent_truncate;
+    filc_ents[372].name = "mkstemp"; filc_ents[372].entry = (void *)ent_mkstemp;
+    filc_ents[373].name = "readv"; filc_ents[373].entry = (void *)ent_readv;
+    filc_ents[374].name = "writev"; filc_ents[374].entry = (void *)ent_writev;
+    filc_ents[375].name = "waitpid"; filc_ents[375].entry = (void *)ent_waitpid;
+    filc_ents[376].name = "getrandom"; filc_ents[376].entry = (void *)ent_getrandom;
+    filc_ents[377].name = "openat"; filc_ents[377].entry = (void *)ent_openat;
+    filc_ents[378].name = "unlinkat"; filc_ents[378].entry = (void *)ent_unlinkat;
+    filc_ents[379].name = "mkdirat"; filc_ents[379].entry = (void *)ent_mkdirat;
+    filc_ents[380].name = "symlinkat"; filc_ents[380].entry = (void *)ent_symlinkat;
+    filc_ents[381].name = "linkat"; filc_ents[381].entry = (void *)ent_linkat;
+    filc_ents[382].name = "renameat"; filc_ents[382].entry = (void *)ent_renameat;
+    filc_ents[383].name = "fchmodat"; filc_ents[383].entry = (void *)ent_fchmodat;
+    filc_ents[384].name = "lchown"; filc_ents[384].entry = (void *)ent_lchown;
+    filc_ents[385].name = "mkdtemp"; filc_ents[385].entry = (void *)ent_mkdtemp;
+    filc_ents[386].name = "futimens"; filc_ents[386].entry = (void *)ent_futimens;
+    filc_ents[387].name = "utimensat"; filc_ents[387].entry = (void *)ent_utimensat;
+    filc_ents[388].name = "fstatat"; filc_ents[388].entry = (void *)ent_fstatat;
+    filc_ents[389].name = "faccessat"; filc_ents[389].entry = (void *)ent_faccessat;
+    filc_ents[390].name = "fchownat"; filc_ents[390].entry = (void *)ent_fchownat;
+    filc_ents[391].name = "preadv"; filc_ents[391].entry = (void *)ent_preadv;
+    filc_ents[392].name = "pwritev"; filc_ents[392].entry = (void *)ent_pwritev;
+    filc_ents[393].name = "posix_memalign"; filc_ents[393].entry = (void *)ent_posix_memalign;
+    filc_ents[394].name = "getentropy"; filc_ents[394].entry = (void *)ent_getentropy;
+    filc_ents[395].name = "sigaction"; filc_ents[395].entry = (void *)ent_sigaction;
     real_longjmp = (filc_lj_fn)dlsym(RTLD_DEFAULT, "longjmp");
     real__longjmp = (filc_lj_fn)dlsym(RTLD_DEFAULT, "_longjmp");
     real_siglongjmp = (filc_lj_fn)dlsym(RTLD_DEFAULT, "siglongjmp");
